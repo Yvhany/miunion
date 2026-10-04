@@ -1,0 +1,13 @@
+# 构建产物
+.gradle/
+build/
+app/build/
+.kotlin/
+
+# 本地配置（含本机 SDK 路径）
+local.properties
+
+# IDE
+.idea/
+*.iml
+captures/

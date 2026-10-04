@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>聚合通行证 · Miuix 文档对照</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="wrap">
+  <h1>按 Miuix 官方文档对照修改</h1>
+  <p class="sub">来源：compose-miuix-ui.github.io/miuix/zh_CN/components/</p>
+
+  <section class="card">
+    <h2>底栏 NavigationBar</h2>
+    <p>已按文档改为 <code>Scaffold(bottomBar = { NavigationBar { NavigationBarItem(...) } })</code>，内容通过 <code>paddingValues</code> 避让。</p>
+    <nav class="navbar-demo">
+      <button class="nav-item active">账号库</button>
+      <button class="nav-item">扫码登录</button>
+      <button class="nav-item">消息</button>
+      <button class="nav-item">设置</button>
+    </nav>
+  </section>
+
+  <section class="card">
+    <h2>皮肤菜单（OverlayDropdownMenu）</h2>
+    <p>三个选项弹出菜单；文档要求该组件必须在 <code>Scaffold</code> 内，VisualPage 已一并包入。</p>
+    <div class="menu-demo">
+      <span class="label">皮肤</span>
+      <span class="value" id="menuValue">亮色皮肤</span>
+      <button id="menuBtn" class="ghost">展开</button>
+      <ul id="menuList" class="menu-list hidden">
+        <li data-mode="light" class="selected">亮色皮肤</li>
+        <li data-mode="dark">暗色皮肤</li>
+        <li data-mode="system">跟随系统皮肤</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>SwitchPreference</h2>
+    <p>液态玻璃开关使用官方 <code>SwitchPreference</code>。</p>
+    <div class="row">
+      <span class="label">启用液态玻璃</span>
+      <button id="glassToggle" class="switch" aria-pressed="false"><span class="knob"></span></button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>本次移除的自写代码</h2>
+    <ul>
+      <li>自定义 FloatingBottomBar（Brush / border / shadow 手写底栏）</li>
+      <li>手写退出登录弹层（改用 OverlayDialog）</li>
+      <li>手写“返回”按钮（改用 TextButton）</li>
+      <li>lightColorScheme/darkColorScheme 的手动 copy 改色（改回官方标准色）</li>
+      <li>无用 import：Brush、ColorFilter、border、shadow、navigationBarsPadding 等</li>
+    </ul>
+  </section>
+
+  <p class="foot">APK：E:\Creative\Android\output\聚合通行证-v0.9.7-miuix-doc.apk</p>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
