@@ -97,7 +97,7 @@ commits:
 - 验收：同步页 WebDAV/云同步密码弹窗、账号管理退出确认弹窗、登录页极验弹窗均可弹出并交互。
 
 ### D9 GitHub 开源（脱敏后上传）
-- 用户指令（2026-10-04）：去掉与隐私相关的 Token/设备标识，把工程开源到 GitHub，关于页链接该仓库；版本号统一 1.0.0。
+- 用户指令（2026-10-04）：去掉与隐私相关的 Token/设备标识，把工程开源到 GitHub，关于页链接该仓库；版本号统一 1.1.0。
 - 脱敏（仅 `AuthApi.kt`，字段结构与格式保持抓包原样，值改为运行时生成或当前设备真实值）：
   - kuro 登录类头：`devCode`（40 hex）与 `distinct_id`（UUID）改为进程级随机；`ip` 头删除（作者内网地址）；`model` 用 `Build.MODEL`；sdkLogin body 的 `devCode` 与头同值。
   - skland 扫码头：`x-deviceid`（32 hex）进程级随机；`x-devicemodel` 用 `Build.MODEL`。
@@ -110,8 +110,17 @@ commits:
 
 ### D10 设置「关于」二级页
 - `SubPage.About` 新增；设置页「关于聚合通行证」行由 toast 改为进入二级页（标题「关于」，转场复用 D2 纯水平推拉）。
-- `AboutPage`（SubPages.kt）：`ic_launcher` 96dp 居中靠上（顶距 64dp）→ 软件名「yvhan」26sp Bold → 副行「聚合通行证 v1.0.0 · Miuix」→ 卡片行「GitHub 开源」（summary `github.com/Yvhany/miunion`），点击 `ACTION_VIEW` 打开仓库地址（常量 `GITHUB_REPO_URL`/`GITHUB_REPO_LABEL`）；设置行 summary 为「yvhan · v1.0.0」。
+- `AboutPage`（SubPages.kt）：`ic_launcher` 96dp 居中靠上（顶距 64dp）→ 软件名「yvhan」26sp Bold → 副行「聚合通行证 v1.1.0 · Miuix」→ 卡片行「GitHub 开源」（summary `github.com/Yvhany/miunion`），点击 `ACTION_VIEW` 打开仓库地址（常量 `GITHUB_REPO_URL`/`GITHUB_REPO_LABEL`）；设置行 summary 为「yvhan · v1.1.0」。
 - Manifest 增加 `<queries>`（ACTION_VIEW + https scheme）满足 Android 11+ 包可见性，保证跳转浏览器可解析。
+
+### D11 账号卡改版（展开角色区 + 右下按钮行）
+- 视觉参照用户设计图；用户决策（2026-10-04）：先做 UI、抓包后再接角色 API；按钮单开一行放右下角（尺寸/间距由实现定）；头部保留原样式「平台图标 + 昵称 + 彩色胶囊平台名 + uid·meta 小字」。
+- 结构（AccountCard）：
+  - 头部整行可点击：原样式内容 + 右侧 20dp 箭头（`MiuixIcons.ChevronForward`，默认收起=▷ 尖口朝右，展开顺时针旋转 90°=∨ 朝下，`animateFloatAsState` 240ms 过渡）；默认收起。
+  - 展开区（`AnimatedVisibility` 纵向展开）：与昵称对齐的缩进列（图标 46dp + 间距 12dp = 58dp），角色行为「游戏名（weight 1）+ 等级（weight 1，左对齐，起点≈内容区中点）」两列布局；本轮无接口 → 空态占位「暂无角色数据 · 待接口接入」。
+  - 卡片不放操作按钮（用户决策 2026-10-04 追加）：「扫码登录」入口=底栏扫码页，「退出」入口=设置页退出登录；AccountCard/AccountsPage 相应回调与退出确认死代码已删。
+  - `items` key 改为 `"$platform:$uid"`（防同平台多账号键冲突）。
+- 后续 T15：用户提供森空岛/米游社（及库街区）角色列表接口 HAR → `UniAccount.roles` 模型 + 拉取缓存 + 角色行真实渲染（游戏名+等级）。
 
 ## [S3] Out of Scope
 - 消息的删除/编辑入口（同步机制支持删除传播，但本版无消息删除 UI；账号退出即账号记录删除）。
@@ -133,4 +142,6 @@ commits:
 - [x] T10: 首屏始终为主页面 — acceptance: pm clear 后冷启动直接进主页面 4 Tab；不登录配置同步可恢复账号与消息 (covers: D7)
 - [x] T11: Scaffold 结构修正（padding 遮挡 + 弹窗宿主） — acceptance: 账号卡片与设置三行完整可见；同步页 WebDAV/密码/退出确认弹窗与登录页极验弹窗可弹出 (covers: D8)
 - [x] T12: GitHub 开源上传（脱敏 + git init + 公开仓库推送） — acceptance: 全仓库无作者设备标识/凭据残留；https://github.com/Yvhany/miunion 公开可访问 (covers: D9)
-- [x] T13: 设置「关于」二级页 — acceptance: 设置→关于进入二级页，图标居中靠上、显示 yvhan、v1.0.0；GitHub 行点击打开仓库页 (covers: D10; depends: T12)
+- [x] T13: 设置「关于」二级页 — acceptance: 设置→关于进入二级页，图标居中靠上、显示 yvhan、v1.1.0；GitHub 行点击打开仓库页 (covers: D10; depends: T12)
+- [x] T14: 账号卡改版 UI（默认收起 + 旋转箭头角色区） — acceptance: 头部原样式保留；默认收起箭头▷、展开旋转90°变∨且角色区空态出现；卡片无操作按钮；折叠/展开流畅（像素级验证） (covers: D11)
+- [ ] T15: 角色数据接口接入 — acceptance: 森空岛/米游社角色列表报文入库，角色行显示真实游戏名+等级 (covers: D11; depends: T14, 用户提供抓包 HAR)

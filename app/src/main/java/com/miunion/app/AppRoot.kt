@@ -22,6 +22,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -67,6 +68,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -601,12 +603,6 @@ fun AppRoot(
                 } else {
                     MainScreen(
                         accounts = accounts,
-                        onAccountsChange = { list ->
-                            accounts = list
-                            val kept = list.map { it.platform }.toSet()
-                            sessions.removeAll { it.platform !in kept }
-                            AuthStore.save(context, sessions.toList())
-                        },
                         scanPlatform = scanPlatform,
                         onScanPlatformChange = { scanPlatform = it },
                         themeMode = themeMode,
@@ -680,7 +676,6 @@ private sealed class SubPage {
 @Composable
 private fun MainScreen(
     accounts: List<UniAccount>,
-    onAccountsChange: (List<UniAccount>) -> Unit,
     scanPlatform: String,
     onScanPlatformChange: (String) -> Unit,
     themeMode: ThemeMode,
@@ -789,15 +784,6 @@ private fun MainScreen(
                         when (page) {
                             0 -> AccountsPage(
                                 accounts = accounts,
-                                onScanWith = { p ->
-                                    onScanPlatformChange(p)
-                                    scope.launch { pagerState.animateScrollToPage(1) }
-                                    onToast("已选择${platformLabel(p)}账号")
-                                },
-                                onRemove = { a ->
-                                    onAccountsChange(accounts - a)
-                                    onToast("已退出 ${a.name}")
-                                },
                                 onAdd = onAddAccount,
                                 nestedScroll = scrollBehavior.nestedScrollConnection,
                             )
@@ -951,65 +937,41 @@ private fun MainBottomBar(
 @Composable
 private fun AccountsPage(
     accounts: List<UniAccount>,
-    onScanWith: (String) -> Unit,
-    onRemove: (UniAccount) -> Unit,
     onAdd: () -> Unit,
     nestedScroll: NestedScrollConnection,
 ) {
-    var pendingRemove by remember { mutableStateOf<UniAccount?>(null) }
-
-    Box(modifier = Modifier.fillMaxSize()) {
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .nestedScroll(nestedScroll)
-                .padding(horizontal = 20.dp),
-            contentPadding = PaddingValues(top = 14.dp, bottom = 20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            if (accounts.isEmpty()) {
-                item {
-                    Text(
-                        text = "还没有登录的账号\n请分别登录米游社 / 森空岛",
-                        fontSize = 14.sp,
-                        color = MiuixTheme.colorScheme.onBackgroundVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 48.dp),
-                    )
-                }
-            } else {
-                items(accounts, key = { it.platform }) { account ->
-                    AccountCard(
-                        account = account,
-                        onScan = { onScanWith(account.platform) },
-                        onRemove = { pendingRemove = account },
-                    )
-                }
-            }
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(nestedScroll)
+            .padding(horizontal = 20.dp),
+        contentPadding = PaddingValues(top = 14.dp, bottom = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (accounts.isEmpty()) {
             item {
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = onAdd,
-                ) {
-                    Text("添加其他平台账号")
-                }
+                Text(
+                    text = "还没有登录的账号\n请分别登录米游社 / 森空岛",
+                    fontSize = 14.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 48.dp),
+                )
+            }
+        } else {
+            items(accounts, key = { "${it.platform}:${it.uid}" }) { account ->
+                AccountCard(account)
             }
         }
-
-        pendingRemove?.let { account ->
-            ConfirmDialog(
-                show = true,
-                title = "退出登录",
-                summary = "确定退出${platformLabel(account.platform)}账号「${account.name}」吗？退出后需要重新登录。",
-                confirmText = "退出",
-                onConfirm = {
-                    onRemove(account)
-                    pendingRemove = null
-                },
-                onDismiss = { pendingRemove = null },
-            )
+        item {
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onAdd,
+            ) {
+                Text("添加其他平台账号")
+            }
         }
     }
 }
@@ -1017,14 +979,26 @@ private fun AccountsPage(
 @Composable
 private fun AccountCard(
     account: UniAccount,
-    onScan: () -> Unit,
-    onRemove: () -> Unit,
 ) {
+    // 默认收起；箭头朝右（▷），展开时顺时针旋转 90° 朝下（∨）
+    var expanded by remember(account.platform, account.uid) { mutableStateOf(false) }
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 90f else 0f,
+        animationSpec = tween(240),
+        label = "account_chevron",
+    )
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         insideMargin = PaddingValues(16.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // 头部：原样式（图标 + 昵称胶囊 + uid 小字）+ 右侧旋转箭头，整行点击切换
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded },
+        ) {
             AccountAvatar(account)
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -1044,21 +1018,25 @@ private fun AccountCard(
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                 )
             }
+            Spacer(Modifier.width(8.dp))
+            Icon(
+                imageVector = MiuixIcons.ChevronForward,
+                contentDescription = if (expanded) "收起角色" else "展开角色",
+                tint = MiuixTheme.colorScheme.onBackgroundVariant,
+                modifier = Modifier
+                    .size(20.dp)
+                    .rotate(chevronRotation),
+            )
         }
-        Spacer(Modifier.height(14.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
-                modifier = Modifier.weight(1f),
-                onClick = onScan,
-                colors = ButtonDefaults.buttonColorsPrimary(),
-            ) {
-                Text("扫码登录")
-            }
-            Button(
-                modifier = Modifier.weight(1f),
-                onClick = onRemove,
-            ) {
-                Text("退出")
+
+        // 展开区：角色行（缩进与昵称对齐），无接口时空态占位
+        AnimatedVisibility(visible = expanded) {
+            Column(modifier = Modifier.padding(start = 58.dp, top = 14.dp)) {
+                Text(
+                    text = "暂无角色数据 · 待接口接入",
+                    fontSize = 12.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                )
             }
         }
     }
@@ -1982,7 +1960,7 @@ private fun SettingsPage(
                     )
                     ArrowPreference(
                         title = "关于聚合通行证",
-                        summary = "yvhan · v1.0.0",
+                        summary = "yvhan · v1.1.0",
                         onClick = onOpenAbout,
                     )
                 }

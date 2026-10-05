@@ -680,7 +680,7 @@ internal fun AboutPage() {
         )
         Spacer(Modifier.height(6.dp))
         Text(
-            text = "聚合通行证 v1.0.0 · Miuix",
+            text = "聚合通行证 v1.1.0 · Miuix",
             fontSize = 13.sp,
             color = MiuixTheme.colorScheme.onBackgroundVariant,
         )
