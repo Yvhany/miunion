@@ -33,6 +33,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -992,12 +993,15 @@ private fun AccountCard(
         modifier = Modifier.fillMaxWidth(),
         insideMargin = PaddingValues(16.dp),
     ) {
-        // 头部：原样式（图标 + 昵称胶囊 + uid 小字）+ 右侧旋转箭头，整行点击切换
+        // 头部：原样式（图标 + 昵称胶囊 + uid 小字）+ 右侧旋转箭头，整行点击切换（无按压水波/阴影）
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { expanded = !expanded },
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) { expanded = !expanded },
         ) {
             AccountAvatar(account)
             Spacer(Modifier.width(12.dp))
