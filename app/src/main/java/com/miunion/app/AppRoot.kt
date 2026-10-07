@@ -330,7 +330,7 @@ private fun accountFromSession(session: AuthSession): UniAccount =
         platform = session.platform,
         name = accountName(session),
         uid = session.uid,
-        meta = platformLabel(session.platform) + " · 长期有效",
+        meta = platformLabel(session.platform),
         expiresAt = session.expiresAt,
         phone = session.phone,
         remark = session.remark,
@@ -1406,6 +1406,18 @@ private fun AccountsPage(
                         Text("取消")
                     }
                 }
+                // 已有备注时提供显式删除入口（清空文本 + 确认也能删，但不直观）
+                if (acc.remark.isNotBlank()) {
+                    TextButton(
+                        text = "删除备注",
+                        onClick = {
+                            onUpdateRemark(acc.platform, acc.uid, "")
+                            remarkTarget = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                    )
+                }
             }
         }
     }
@@ -1507,22 +1519,28 @@ private fun AccountCard(
                         PlatformBadge(account.platform)
                     }
                 }
-                Spacer(Modifier.height(4.dp))
-                // 第二行：手机号（默认掩码，眼睛睁开显示全文）+ 备注；无手机号时显示原 meta
+                // 第二行：手机号（默认掩码，眼睛睁开显示全文）+ 备注。
+                // 无手机号不回退 meta（头部已有平台胶囊，重复显示无意义）
                 val phoneDisplay = if (account.phone.isNotBlank()) {
                     if (showPhone) account.phone else maskPhone(account.phone)
                 } else {
-                    account.meta
+                    ""
                 }
-                Text(
-                    text = if (account.remark.isNotBlank()) {
+                val secondLine = when {
+                    phoneDisplay.isNotBlank() && account.remark.isNotBlank() ->
                         "$phoneDisplay · ${account.remark}"
-                    } else {
-                        phoneDisplay
-                    },
-                    fontSize = 12.sp,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                )
+                    phoneDisplay.isNotBlank() -> phoneDisplay
+                    account.remark.isNotBlank() -> account.remark
+                    else -> ""
+                }
+                if (secondLine.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = secondLine,
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    )
+                }
             }
             Spacer(Modifier.width(8.dp))
             if (reorderMode) {

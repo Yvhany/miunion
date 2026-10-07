@@ -15,3 +15,6 @@ captures/
 # 签名私钥（勿入库）
 release.keystore
 *.jks
+
+# 发布产物不入库
+output/
