@@ -86,10 +86,16 @@ object SyncStore {
 
     // ---- WebDAV 账号 ----
 
+    /**
+     * 粘贴的 URL 可能混入换行/空格（换行让请求路径变成畸形地址，
+     * 服务端返回 403），读写两侧统一剔除所有空白字符。
+     */
+    private fun sanitizeUrl(url: String): String = url.filterNot { it.isWhitespace() }
+
     fun config(context: Context): WebDavConfig {
         val p = prefs(context)
         return WebDavConfig(
-            url = p.getString("url", "").orEmpty(),
+            url = sanitizeUrl(p.getString("url", "").orEmpty()),
             user = p.getString("user", "").orEmpty(),
             pass = p.getString("pass", "").orEmpty(),
         )
@@ -97,19 +103,95 @@ object SyncStore {
 
     fun saveConfig(context: Context, cfg: WebDavConfig) {
         prefs(context).edit()
-            .putString("url", cfg.url.trim())
+            .putString("url", sanitizeUrl(cfg.url))
             .putString("user", cfg.user.trim())
             .putString("pass", cfg.pass)
             .apply()
     }
 
     // ---- 云同步密码（本机保存；云端只存密文）----
+    // 二级模式：用 AndroidKeystore 密钥加密后落盘（password_ks）；
+    // 明文模式（用户主动选择不设二级密码）：旧键 password 直存。
 
-    fun password(context: Context): String =
-        prefs(context).getString("password", "").orEmpty()
+    private const val KS_ALIAS = "miunion_sync_pwd"
+    private const val KEY_KS = "password_ks"
+    private const val KEY_PLAIN = "password"
 
-    fun setPassword(context: Context, password: String) {
-        prefs(context).edit().putString("password", password).apply()
+    private fun ksKey(): javax.crypto.SecretKey {
+        val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getKey(KS_ALIAS, null) as? javax.crypto.SecretKey)?.let { return it }
+        val gen = javax.crypto.KeyGenerator.getInstance(
+            android.security.keystore.KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore",
+        )
+        gen.init(
+            android.security.keystore.KeyGenParameterSpec.Builder(
+                KS_ALIAS,
+                android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or
+                    android.security.keystore.KeyProperties.PURPOSE_DECRYPT,
+            )
+                .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build(),
+        )
+        return gen.generateKey()
+    }
+
+    private fun ksEncrypt(plain: String): String {
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, ksKey())
+        val ct = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
+        return Base64.encodeToString(cipher.iv + ct, Base64.NO_WRAP)
+    }
+
+    /** Keystore 密钥失效（如恢复安装）返回 null，调用方回落/清理。 */
+    private fun ksDecrypt(blob: String): String? = try {
+        val data = Base64.decode(blob, Base64.DEFAULT)
+        if (data.size <= 12) return null
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            javax.crypto.Cipher.DECRYPT_MODE,
+            ksKey(),
+            javax.crypto.spec.GCMParameterSpec(128, data, 0, 12),
+        )
+        String(cipher.doFinal(data, 12, data.size - 12), Charsets.UTF_8)
+    } catch (e: Exception) {
+        null
+    }
+
+    /** ""=未设置 / "ks"=加密存储（Keystore）/ "plain"=明文存储。 */
+    fun passwordMode(context: Context): String {
+        val p = prefs(context)
+        return when {
+            p.getString(KEY_KS, null) != null -> "ks"
+            !p.getString(KEY_PLAIN, "").isNullOrBlank() -> "plain"
+            else -> ""
+        }
+    }
+
+    fun password(context: Context): String {
+        val p = prefs(context)
+        p.getString(KEY_KS, null)?.let { blob ->
+            ksDecrypt(blob)?.let { return it }
+            // Keystore 密钥已失效：清掉无法解开的密文，走“重新设置”流程
+            p.edit().remove(KEY_KS).apply()
+        }
+        return p.getString(KEY_PLAIN, "").orEmpty()
+    }
+
+    /** 二级密码模式：Keystore 加密落盘，明文不写文件。 */
+    fun setPasswordKs(context: Context, password: String) {
+        prefs(context).edit()
+            .putString(KEY_KS, ksEncrypt(password))
+            .remove(KEY_PLAIN)
+            .apply()
+    }
+
+    /** 明文模式（用户经二次确认选择不设二级密码）。 */
+    fun setPasswordPlain(context: Context, password: String) {
+        prefs(context).edit()
+            .putString(KEY_PLAIN, password)
+            .remove(KEY_KS)
+            .apply()
     }
 
     fun hasPassword(context: Context): Boolean = password(context).isNotBlank()
@@ -191,6 +273,9 @@ object SyncStore {
         .put("nickname", s.nickname)
         .put("expiresAt", s.expiresAt)
         .put("savedAt", s.savedAt)
+        .put("sortOrder", s.sortOrder)
+        .put("phone", s.phone)
+        .put("remark", s.remark)
 
     private fun sessionFromJson(o: JSONObject): AuthSession = AuthSession(
         platform = o.optString("platform"),
@@ -204,6 +289,9 @@ object SyncStore {
         nickname = o.optString("nickname"),
         expiresAt = o.optLong("expiresAt"),
         savedAt = o.optLong("savedAt"),
+        sortOrder = o.optInt("sortOrder", -1),
+        phone = o.optString("phone"),
+        remark = o.optString("remark"),
     )
 
     private fun messageToJson(m: UniMessage): JSONObject = JSONObject()
@@ -219,13 +307,13 @@ object SyncStore {
         id = o.optString("id"),
     )
 
-    /** id → 明文载荷（账号 account_<platform>；消息为 uuid，id 为空的历史消息跳过）。 */
+    /** id → 明文载荷（账号 account_<platform>_<uid>，一平台多账号分开存；消息为 uuid）。 */
     fun buildLocalRecords(
         sessions: List<AuthSession>,
         messages: List<UniMessage>,
     ): Map<String, String> {
         val map = LinkedHashMap<String, String>()
-        sessions.forEach { map["account_${it.platform}"] = sessionToJson(it).toString() }
+        sessions.forEach { map["account_${it.platform}_${it.uid}"] = sessionToJson(it).toString() }
         messages.forEach { m ->
             if (m.id.isNotBlank()) map[m.id] = messageToJson(m).toString()
         }
@@ -477,9 +565,9 @@ object SyncStore {
         if (password.isBlank()) {
             return SyncOutcome.NeedPassword(
                 if (remoteIds.isNotEmpty()) {
-                    "首次从云端同步，请输入云同步密码解密数据"
+                    "云端已有数据：请输入与云端一致的密钥，将以加密方式保存在本机"
                 } else {
-                    "首次同步，请设置云同步密码（用于加密云端数据）"
+                    "首次同步：请设置密钥（用于加密云端数据），将以系统加密保存在本机"
                 }
             )
         }
@@ -490,7 +578,7 @@ object SyncStore {
             when (val d = download(cfg, fileUrl(cfg, id))) {
                 is Remote.Found -> {
                     val plain = open(password, d.body)
-                        ?: return SyncOutcome.Error("云同步密码错误或云端数据损坏")
+                        ?: return SyncOutcome.Error("密钥错误或云端数据损坏")
                     remote[id] = plain
                 }
                 Remote.Missing -> Unit // 列表与下载之间被删，按不存在处理
@@ -600,8 +688,13 @@ object SyncStore {
         var finalMessages = messages.toList()
         for (id in deleteLocalIds) {
             if (id.startsWith("account_")) {
-                val platform = id.removePrefix("account_")
-                finalSessions = finalSessions.filterNot { it.platform == platform }
+                // account_<platform>_<uid>；兼容旧格式 account_<platform>（无 uid 时按平台删）
+                val rest = id.removePrefix("account_")
+                val platform = if ('_' in rest) rest.substringBeforeLast('_') else rest
+                val uid = if ('_' in rest) rest.substringAfterLast('_') else ""
+                finalSessions = finalSessions.filterNot {
+                    it.platform == platform && (uid.isBlank() || it.uid == uid)
+                }
             } else {
                 finalMessages = finalMessages.filterNot { it.id == id }
             }
@@ -611,7 +704,9 @@ object SyncStore {
                 val o = JSONObject(payload)
                 if (o.has("platform")) {
                     val s = sessionFromJson(o)
-                    finalSessions = finalSessions.filterNot { it.platform == s.platform } + s
+                    finalSessions = finalSessions.filterNot {
+                        it.platform == s.platform && it.uid == s.uid
+                    } + s
                 } else {
                     val m = messageFromJson(o)
                     finalMessages = if (finalMessages.any { it.id == m.id }) {
@@ -653,7 +748,7 @@ object SyncStore {
         val cfg = config(context)
         if (cfg.url.isBlank()) return SyncOutcome.Error("请先配置 WebDAV 账号")
         val password = password(context)
-        if (password.isBlank()) return SyncOutcome.NeedPassword("请先设置云同步密码")
+        if (password.isBlank()) return SyncOutcome.NeedPassword("请先设置密钥")
 
         val remoteIds = when (val r = listIds(cfg)) {
             is ListResult.Ok -> r.ids
@@ -678,7 +773,7 @@ object SyncStore {
         )
         saveConflicts(context, emptyList())
         markSynced(context)
-        return SyncOutcome.Done("已用新密码重新加密上传（本地数据为准）")
+        return SyncOutcome.Done("已用新密钥重新加密上传（本地数据为准）")
     }
 
     /**
@@ -695,7 +790,7 @@ object SyncStore {
         val cfg = config(context)
         if (cfg.url.isBlank()) return SyncOutcome.Error("请先配置 WebDAV 账号")
         val password = password(context)
-        if (password.isBlank()) return SyncOutcome.NeedPassword("请先设置云同步密码")
+        if (password.isBlank()) return SyncOutcome.NeedPassword("请先设置密钥")
         val conflicts = loadConflicts(context).toMutableList()
         val entry = conflicts.firstOrNull { it.id == id }
             ?: return SyncOutcome.Error("该冲突已不存在")
@@ -735,4 +830,77 @@ object SyncStore {
     private fun dateText(ts: Long): String =
         java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA)
             .format(java.util.Date(ts))
+}
+
+/**
+ * 本地加密备份（导出/导入）：把全部账号与消息打包成一个加密文件，不依赖云同步。
+ * 复用 SyncStore 的 PBKDF2 + AES-GCM 信封；密钥即「密钥」。
+ */
+object BackupStore {
+    private const val TYPE = "miunion-backup-v1"
+
+    data class Backup(
+        val sessions: List<AuthSession>,
+        val messages: List<UniMessage>,
+    )
+
+    /** 明文 JSON（type 标记 + sessions + messages）。 */
+    fun plain(sessions: List<AuthSession>, messages: List<UniMessage>): String {
+        val msgArr = JSONArray()
+        messages.forEach { m ->
+            msgArr.put(
+                JSONObject()
+                    .put("id", m.id)
+                    .put("title", m.title)
+                    .put("time", m.time)
+                    .put("desc", m.desc),
+            )
+        }
+        return JSONObject()
+            .put("type", TYPE)
+            .put("sessions", JSONObject(AuthStore.serialize(sessions)).getJSONArray("sessions"))
+            .put("messages", msgArr)
+            .toString()
+    }
+
+    /** 解密并解析备份；密码错误/非备份文件返回 null。 */
+    fun parse(password: String, envelope: String): Backup? {
+        val plain = SyncStore.open(password, envelope) ?: return null
+        return try {
+            val o = JSONObject(plain)
+            if (o.optString("type") != TYPE) return null
+            val sessions = AuthStore.parse(plain)
+            val msgArr = o.optJSONArray("messages") ?: JSONArray()
+            val messages = (0 until msgArr.length()).map { i ->
+                val m = msgArr.getJSONObject(i)
+                UniMessage(
+                    id = m.optString("id").ifBlank { java.util.UUID.randomUUID().toString() },
+                    title = m.optString("title"),
+                    time = m.optString("time"),
+                    desc = m.optString("desc"),
+                )
+            }
+            Backup(sessions, messages)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 合并到本地：同 platform+uid 的账号、同 id 的消息以备份为准，
+     * 本地独有的保留。返回 (sessions, messages)。
+     */
+    fun merge(
+        localSessions: List<AuthSession>,
+        localMessages: List<UniMessage>,
+        backup: Backup,
+    ): Pair<List<AuthSession>, List<UniMessage>> {
+        val sMap = LinkedHashMap<String, AuthSession>()
+        localSessions.forEach { sMap["${it.platform}:${it.uid}"] = it }
+        backup.sessions.forEach { sMap["${it.platform}:${it.uid}"] = it }
+        val mMap = LinkedHashMap<String, UniMessage>()
+        localMessages.forEach { if (it.id.isNotBlank()) mMap[it.id] = it }
+        backup.messages.forEach { if (it.id.isNotBlank()) mMap[it.id] = it }
+        return sMap.values.toList() to mMap.values.toList()
+    }
 }

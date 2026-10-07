@@ -32,11 +32,15 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -63,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
@@ -81,9 +86,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
@@ -100,6 +111,8 @@ import androidx.core.view.WindowCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import coil.compose.AsyncImage
+import androidx.compose.ui.layout.ContentScale
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -131,6 +144,9 @@ import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Hide
+import top.yukonga.miuix.kmp.icon.extended.Refresh
+import top.yukonga.miuix.kmp.icon.extended.Show
 import top.yukonga.miuix.kmp.icon.extended.*
 import top.yukonga.miuix.kmp.menu.OverlayDropdownMenu
 import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
@@ -152,7 +168,31 @@ data class UniAccount(
     val uid: String,
     val meta: String,
     val expiresAt: Long = 0L,
+    val phone: String = "",
+    val remark: String = "",
 )
+
+/** 按 sortOrder 展示；旧数据缺失时按当前序补齐。 */
+fun orderedSessions(sessions: List<AuthSession>): List<AuthSession> =
+    sessions.mapIndexed { i, s -> if (s.sortOrder < 0) s.copy(sortOrder = i) else s }
+        .sortedBy { it.sortOrder }
+
+/** 手机号掩码：12345678945 → 123******45（前3后2，中间打星）。 */
+fun maskPhone(phone: String): String =
+    if (phone.length >= 7) {
+        phone.take(3) + "*".repeat(phone.length - 5) + phone.takeLast(2)
+    } else {
+        "*".repeat(phone.length)
+    }
+
+/** 备注长度：中文/全角按 2 计、其余按 1 计，上限 10。 */
+fun remarkLength(s: String): Int =
+    s.sumOf { c ->
+        when (c.code) {
+            in 0x2E80..0x9FFF, in 0xF900..0xFAFF, in 0xFF00..0xFFEF, in 0x3000..0x303F -> 2
+            else -> 1
+        }
+    }
 
 data class UniMessage(
     val title: String,
@@ -292,6 +332,8 @@ private fun accountFromSession(session: AuthSession): UniAccount =
         uid = session.uid,
         meta = platformLabel(session.platform) + " · 长期有效",
         expiresAt = session.expiresAt,
+        phone = session.phone,
+        remark = session.remark,
     )
 
 @Composable
@@ -492,7 +534,7 @@ fun AppRoot(
     addMessage: (String, String) -> Unit,
     replaceMessages: (List<UniMessage>) -> Unit,
 ) {
-    var accounts by remember { mutableStateOf(sessions.map(::accountFromSession)) }
+    var accounts by remember { mutableStateOf(orderedSessions(sessions).map(::accountFromSession)) }
     var adding by remember { mutableStateOf(false) }
     var scanPlatform by remember { mutableStateOf("mihoyo") }
     var toast by remember { mutableStateOf<String?>(null) }
@@ -510,7 +552,7 @@ fun AppRoot(
     }
 
     LaunchedEffect(sessions.toList()) {
-        accounts = sessions.map(::accountFromSession)
+        accounts = orderedSessions(sessions).map(::accountFromSession)
     }
 
     fun showToast(msg: String) {
@@ -561,7 +603,10 @@ fun AppRoot(
                     ) { _ ->
                         LoginScreen(
                         onLoggedIn = { session ->
-                            sessions.removeAll { it.platform == session.platform }
+                            // 一平台多账号：同 uid 覆盖，不同 uid 追加
+                            sessions.removeAll {
+                                it.platform == session.platform && it.uid == session.uid
+                            }
                             sessions.add(session)
                             AuthStore.save(context, sessions.toList())
                             addMessage(
@@ -612,16 +657,22 @@ fun AppRoot(
                         onGlassEnabledChange = onGlassEnabledChange,
                         onToast = ::showToast,
                         onAddAccount = { adding = true },
-                        onLogout = { platform ->
+                        onLogout = { platform, uid ->
                             if (platform == null) {
                                 accounts = emptyList()
                                 sessions.clear()
                                 AuthStore.save(context, emptyList())
                                 scanPlatform = "mihoyo"
                             } else {
-                                accounts = accounts.filterNot { it.platform == platform }
-                                sessions.removeAll { it.platform == platform }
+                                sessions.removeAll {
+                                    it.platform == platform && (uid == null || it.uid == uid)
+                                }
                                 AuthStore.save(context, sessions.toList())
+                                accounts = if (uid == null) {
+                                    accounts.filterNot { it.platform == platform }
+                                } else {
+                                    accounts.filterNot { it.platform == platform && it.uid == uid }
+                                }
                                 if (accounts.isEmpty()) scanPlatform = "mihoyo"
                             }
                         },
@@ -630,6 +681,29 @@ fun AppRoot(
                             sessions.addAll(syncedSessions)
                             AuthStore.save(context, sessions.toList())
                             replaceMessages(syncedMessages)
+                        },
+                        onReorderSessions = { reordered ->
+                            sessions.clear()
+                            sessions.addAll(reordered)
+                            AuthStore.save(context, sessions.toList())
+                        },
+                        onUpdatePhone = { platform, uid, phone ->
+                            val i = sessions.indexOfFirst {
+                                it.platform == platform && it.uid == uid
+                            }
+                            if (i >= 0) {
+                                sessions[i] = sessions[i].copy(phone = phone)
+                                AuthStore.save(context, sessions.toList())
+                            }
+                        },
+                        onUpdateRemark = { platform, uid, remark ->
+                            val i = sessions.indexOfFirst {
+                                it.platform == platform && it.uid == uid
+                            }
+                            if (i >= 0) {
+                                sessions[i] = sessions[i].copy(remark = remark)
+                                AuthStore.save(context, sessions.toList())
+                            }
                         },
                         messages = messages,
                         sessions = sessions,
@@ -672,6 +746,7 @@ private sealed class SubPage {
     object Sync : SubPage()
     object About : SubPage()
     data class Msg(val message: UniMessage, val platform: String) : SubPage()
+    data class GameDetail(val row: GameRoleRow, val session: AuthSession?) : SubPage()
 }
 
 @Composable
@@ -685,13 +760,25 @@ private fun MainScreen(
     onGlassEnabledChange: (Boolean) -> Unit,
     onToast: (String) -> Unit,
     onAddAccount: () -> Unit,
-    onLogout: (String?) -> Unit,
+    onLogout: (String?, String?) -> Unit,
     messages: List<UniMessage>,
     sessions: List<AuthSession>,
     onMessage: (String, String) -> Unit,
     onSyncApplied: (List<AuthSession>, List<UniMessage>) -> Unit,
+    onReorderSessions: (List<AuthSession>) -> Unit,
+    onUpdatePhone: (String, String, String) -> Unit,
+    onUpdateRemark: (String, String, String) -> Unit,
 ) {
     var subPage by remember { mutableStateOf<SubPage?>(null) }
+    // 账号卡展开状态上提到主页层：进游戏详情等二级页再返回时保持展开
+    var expandedAccountKeys by remember { mutableStateOf(setOf<String>()) }
+    // 手机号显示开关（右上角眼睛）：仅本次会话有效，不记忆，重启恢复为隐藏
+    var showPhone by remember { mutableStateOf(false) }
+    // 排序模式上提主页层：排序期间锁定底栏/横滑/眼睛等页面切换
+    var reorderMode by remember { mutableStateOf(false) }
+    var workingOrder by remember { mutableStateOf<List<UniAccount>?>(null) }
+    // 角色信息刷新（标题栏刷新按钮 → AccountsPage 重新拉取并覆盖缓存）
+    var rolesRefreshTick by remember { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
     val pagerState = rememberPagerState(pageCount = { 4 })
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -746,6 +833,42 @@ private fun MainScreen(
                         title = pageTitle,
                         largeTitle = pageTitle,
                         scrollBehavior = scrollBehavior,
+                        actions = {
+                            // 刷新角色信息（仅账号库页显示）
+                            if (pagerState.currentPage == 0) {
+                                IconButton(
+                                    onClick = {
+                                        if (!reorderMode) {
+                                            rolesRefreshTick++
+                                            onToast("正在刷新角色信息")
+                                        }
+                                    },
+                                    modifier = Modifier.graphicsLayer {
+                                        translationY = (1f - scrollBehavior.state.collapsedFraction) *
+                                            52.dp.toPx()
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = MiuixIcons.Refresh,
+                                        contentDescription = "刷新角色信息",
+                                    )
+                                }
+                            }
+                            // 眼睛跟随标题：展开（collapsedFraction=0）时下移到大标题行，
+                            // 收起（=1）回小标题行，两种状态都与标题对齐
+                            val titleShift = (1f - scrollBehavior.state.collapsedFraction)
+                            IconButton(
+                                onClick = { if (!reorderMode) showPhone = !showPhone },
+                                modifier = Modifier.graphicsLayer {
+                                    translationY = titleShift * 52.dp.toPx()
+                                },
+                            ) {
+                                Icon(
+                                    imageVector = if (showPhone) MiuixIcons.Show else MiuixIcons.Hide,
+                                    contentDescription = if (showPhone) "隐藏手机号" else "显示手机号",
+                                )
+                            }
+                        },
                     )
                 },
                 bottomBar = {
@@ -756,7 +879,11 @@ private fun MainScreen(
                             listOf("账号库", "扫码登录", "消息", "设置").forEachIndexed { index, label ->
                                 FloatingNavigationBarItem(
                                     selected = pagerState.currentPage == index,
-                                    onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
+                                    onClick = {
+                                        if (!reorderMode) {
+                                            scope.launch { pagerState.animateScrollToPage(index) }
+                                        }
+                                    },
                                     icon = listOf(
                                         MiuixIcons.Community,
                                         MiuixIcons.Scan,
@@ -770,7 +897,11 @@ private fun MainScreen(
                     } else {
                         MainBottomBar(
                             selected = pagerState.currentPage,
-                            onSelect = { scope.launch { pagerState.animateScrollToPage(it) } },
+                            onSelect = {
+                                if (!reorderMode) {
+                                    scope.launch { pagerState.animateScrollToPage(it) }
+                                }
+                            },
                         )
                     }
                 },
@@ -778,6 +909,7 @@ private fun MainScreen(
                 Box(modifier = Modifier.fillMaxSize()) {
                     HorizontalPager(
                         state = pagerState,
+                        userScrollEnabled = !reorderMode,
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(paddingValues),
@@ -788,6 +920,38 @@ private fun MainScreen(
                                 sessions = sessions,
                                 onAdd = onAddAccount,
                                 nestedScroll = scrollBehavior.nestedScrollConnection,
+                                onOpenGameDetail = { account, row ->
+                                    subPage = SubPage.GameDetail(
+                                        row,
+                                        sessions.find {
+                                            it.platform == account.platform && it.uid == account.uid
+                                        },
+                                    )
+                                },
+                                expandedKeys = expandedAccountKeys,
+                                onToggleExpand = { key ->
+                                    expandedAccountKeys = if (key in expandedAccountKeys) {
+                                        expandedAccountKeys - key
+                                    } else {
+                                        expandedAccountKeys + key
+                                    }
+                                },
+                                onReorder = onReorderSessions,
+                                showPhone = showPhone,
+                                reorderMode = reorderMode,
+                                workingOrder = workingOrder,
+                                onEnterReorder = {
+                                    reorderMode = true
+                                    workingOrder = accounts
+                                    expandedAccountKeys = emptySet()
+                                },
+                                onDragReorder = { order -> workingOrder = order },
+                                onExitReorder = {
+                                    reorderMode = false
+                                    workingOrder = null
+                                },
+                                onUpdateRemark = onUpdateRemark,
+                                rolesRefreshTick = rolesRefreshTick,
                             )
                             1 -> ScanPage(
                                 accounts = accounts,
@@ -826,6 +990,45 @@ private fun MainScreen(
                             .align(Alignment.TopCenter)
                             .padding(paddingValues),
                     )
+
+                    // 旧版（明文存储）升级提示：仅弹一次，确认=迁移加密，取消=保持明文
+                    val mainContext = LocalContext.current
+                    var showKsUpgrade by remember { mutableStateOf(false) }
+                    LaunchedEffect(Unit) {
+                        val prefs = mainContext.getSharedPreferences("sync_prefs", Context.MODE_PRIVATE)
+                        if (!prefs.contains("ks_migration") &&
+                            SyncStore.passwordMode(mainContext) == "plain"
+                        ) {
+                            showKsUpgrade = true
+                        }
+                    }
+                    if (showKsUpgrade) {
+                        ConfirmDialog(
+                            show = true,
+                            title = "升级为加密存储",
+                            summary = "检测到云同步密钥当前以明文存储在本机。升级后将改用系统级加密（Keystore）保存，同步功能与密钥本身不受影响。",
+                            confirmText = "升级",
+                            onConfirm = {
+                                showKsUpgrade = false
+                                mainContext.getSharedPreferences("sync_prefs", Context.MODE_PRIVATE)
+                                    .edit().putString("ks_migration", "1").apply()
+                                val pwd = SyncStore.password(mainContext)
+                                if (pwd.isNotBlank()) {
+                                    try {
+                                        SyncStore.setPasswordKs(mainContext, pwd)
+                                        onToast("密钥已升级为加密存储")
+                                    } catch (e: Exception) {
+                                        onToast("升级失败，仍为明文存储")
+                                    }
+                                }
+                            },
+                            onDismiss = {
+                                showKsUpgrade = false
+                                mainContext.getSharedPreferences("sync_prefs", Context.MODE_PRIVATE)
+                                    .edit().putString("ks_migration", "1").apply()
+                            },
+                        )
+                    }
                 }
             }
         } else {
@@ -845,6 +1048,7 @@ private fun MainScreen(
                             SubPage.Sync -> "账号与同步"
                             SubPage.About -> "关于"
                             is SubPage.Msg -> "消息详情"
+                            is SubPage.GameDetail -> current.row.gameName
                         },
                         navigationIcon = {
                             IconButton(onClick = { subPage = null }) {
@@ -865,10 +1069,11 @@ private fun MainScreen(
                                 nestedScroll = scrollBehavior.nestedScrollConnection,
                             )
                             SubPage.Sync -> SyncPage(
-                                sessions = sessions,
+                                sessions = orderedSessions(sessions),
                                 messages = messages,
                                 onApplied = onSyncApplied,
-                                onLogout = { platform -> onLogout(platform) },
+                                onLogout = { platform, uid -> onLogout(platform, uid) },
+                                onUpdatePhone = onUpdatePhone,
                                 onToast = onToast,
                                 nestedScroll = scrollBehavior.nestedScrollConnection,
                             )
@@ -876,6 +1081,11 @@ private fun MainScreen(
                             is SubPage.Msg -> MessageDetailPage(
                                 message = current.message,
                                 platform = current.platform,
+                                nestedScroll = scrollBehavior.nestedScrollConnection,
+                            )
+                            is SubPage.GameDetail -> GameDetailPage(
+                                row = current.row,
+                                session = current.session,
                                 nestedScroll = scrollBehavior.nestedScrollConnection,
                             )
                         }
@@ -942,26 +1152,109 @@ private fun AccountsPage(
     sessions: List<AuthSession>,
     onAdd: () -> Unit,
     nestedScroll: NestedScrollConnection,
+    onOpenGameDetail: (UniAccount, GameRoleRow) -> Unit,
+    expandedKeys: Set<String>,
+    onToggleExpand: (String) -> Unit,
+    onReorder: (List<AuthSession>) -> Unit,
+    showPhone: Boolean,
+    reorderMode: Boolean,
+    workingOrder: List<UniAccount>?,
+    onEnterReorder: () -> Unit,
+    onDragReorder: (List<UniAccount>) -> Unit,
+    onExitReorder: () -> Unit,
+    onUpdateRemark: (String, String, String) -> Unit,
+    rolesRefreshTick: Int,
 ) {
+    val appContext = LocalContext.current
     var rolesMap by remember { mutableStateOf(mapOf<String, List<GameRoleRow>>()) }
     var rolesLoading by remember { mutableStateOf(true) }
+    // 拖拽排序：按住三横杠把手拖动（等高卡假设；进入排序时自动收起所有卡）
+    var dragKey by remember { mutableStateOf<String?>(null) }
+    var dragOffsetY by remember { mutableStateOf(0f) }
+    var rowHeightPx by remember { mutableStateOf(0f) }
+    val density = LocalDensity.current
+    // 排序模式下单击卡片 → 编辑备注
+    var remarkTarget by remember { mutableStateOf<UniAccount?>(null) }
+    var remarkField by remember { mutableStateOf("") }
 
-    LaunchedEffect(accounts.map { "${it.platform}:${it.uid}" }) {
-        rolesLoading = true
+    val roleCache = remember { RoleCache.load(appContext) }
+
+    LaunchedEffect(accounts.map { "${it.platform}:${it.uid}" }, rolesRefreshTick) {
+        val keys = accounts.map { "${it.platform}:${it.uid}" }.toSet()
+        // 1) 先显示缓存（没有缓存即首次才显示“获取中”）
+        val cached = roleCache.filterKeys { it in keys }
+        if (cached.isNotEmpty()) {
+            rolesMap = cached
+            rolesLoading = false
+        } else {
+            rolesLoading = true
+        }
+        // 2) 后台拉取；按账号合并：只有拉到数据的账号覆盖缓存，
+        // 失败/为空的账号保留旧缓存（否则一个平台成功会把其他平台的缓存整体抹掉）
         val result = mutableMapOf<String, List<GameRoleRow>>()
         for (account in accounts) {
             val key = "${account.platform}:${account.uid}"
             val session = sessions.find { it.platform == account.platform && it.uid == account.uid }
                 ?: sessions.find { it.platform == account.platform }
-            result[key] = when {
+            val fresh = when {
                 session == null -> emptyList()
                 account.platform == "skland" -> AuthApi.fetchSklandRoles(session)
                 account.platform == "mihoyo" -> AuthApi.fetchMihoyoGameRecord(session)
                 else -> emptyList()
             }
+            result[key] = if (fresh.isNotEmpty()) fresh else (cached[key] ?: fresh)
         }
-        rolesMap = result
+        if (result.values.any { it.isNotEmpty() }) {
+            rolesMap = result
+            RoleCache.save(appContext, result)
+        } else if (cached.isEmpty()) {
+            rolesMap = result
+        }
         rolesLoading = false
+    }
+
+    val displayAccounts = workingOrder ?: accounts
+
+    fun handleDragStart(key: String) {
+        if (!reorderMode) onEnterReorder()
+        dragKey = key
+        dragOffsetY = 0f
+    }
+
+    fun handleDrag(dy: Float) {
+        val key = dragKey ?: return
+        dragOffsetY += dy
+        val rowH = rowHeightPx
+        if (rowH <= 0f) return
+        val list = workingOrder ?: return
+        val from = list.indexOfFirst { "${it.platform}:${it.uid}" == key }
+        if (from < 0) return
+        val target = (from + Math.round(dragOffsetY / rowH)).coerceIn(0, list.lastIndex)
+        if (target != from) {
+            val m = list.toMutableList()
+            val item = m.removeAt(from)
+            m.add(target, item)
+            dragOffsetY -= (target - from) * rowH
+            onDragReorder(m)
+        }
+    }
+
+    fun handleDragEnd() {
+        dragKey = null
+        dragOffsetY = 0f
+    }
+
+    fun saveOrder() {
+        val order = workingOrder ?: return
+        val byKey = sessions.associateBy { "${it.platform}:${it.uid}" }
+        val reordered = order.mapIndexedNotNull { i, acc ->
+            byKey["${acc.platform}:${acc.uid}"]?.copy(sortOrder = i)
+        }
+        val rest = sessions
+            .filter { s -> order.none { it.platform == s.platform && it.uid == s.uid } }
+            .mapIndexed { i, s -> s.copy(sortOrder = order.size + i) }
+        onReorder(reordered + rest)
+        onExitReorder()
     }
 
     LazyColumn(
@@ -972,6 +1265,17 @@ private fun AccountsPage(
         contentPadding = PaddingValues(top = 14.dp, bottom = 20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (reorderMode) {
+            item {
+                Text(
+                    text = "按住三横杠拖动排序 · 点击卡片编辑备注",
+                    fontSize = 12.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
         if (accounts.isEmpty()) {
             item {
                 Text(
@@ -985,22 +1289,149 @@ private fun AccountsPage(
                 )
             }
         } else {
-            items(accounts, key = { "${it.platform}:${it.uid}" }) { account ->
+            items(displayAccounts, key = { "${it.platform}:${it.uid}" }) { account ->
                 val key = "${account.platform}:${account.uid}"
-                AccountCard(
-                    account = account,
-                    roles = rolesMap[key],
-                    rolesLoading = rolesLoading,
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onGloballyPositioned {
+                            rowHeightPx = it.size.height.toFloat() +
+                                with(density) { 12.dp.toPx() }
+                        }
+                        // 位移动画只在排序模式下启用：拖拽换位需要它让相邻卡滑开；
+                        // 普通模式下卡片展开会逐帧改变下方布局，弹簧追帧会让下方卡片
+                        // 滞后于底部按钮（无动画），产生不同步的视觉异常。
+                        // 且被拖拽卡的手动 dragOffsetY 会与弹簧动画叠加导致跳变。
+                        .then(
+                            if (reorderMode && dragKey != key) {
+                                Modifier.animateItem()
+                            } else {
+                                Modifier
+                            }
+                        ),
+                ) {
+                    AccountCard(
+                        account = account,
+                        roles = rolesMap[key],
+                        rolesLoading = rolesLoading,
+                        expanded = key in expandedKeys && !reorderMode,
+                        onToggle = { onToggleExpand(key) },
+                        onOpenGame = { row -> onOpenGameDetail(account, row) },
+                        reorderMode = reorderMode,
+                        onEnterReorder = { onEnterReorder() },
+                        onRemark = {
+                            remarkTarget = account
+                            remarkField = account.remark
+                        },
+                        onHandleDragStart = { handleDragStart(key) },
+                        onHandleDrag = { dy -> handleDrag(dy) },
+                        onHandleDragEnd = { handleDragEnd() },
+                        dragTranslationY = if (dragKey == key) dragOffsetY else null,
+                        showPhone = showPhone,
+                    )
+                }
             }
         }
         item {
-            Button(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = onAdd,
-            ) {
-                Text("添加其他平台账号")
+            if (reorderMode) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { saveOrder() },
+                    ) {
+                        Text("保存顺序")
+                    }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { onExitReorder() },
+                    ) {
+                        Text("取消")
+                    }
+                }
+            } else {
+                Button(
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = onAdd,
+                ) {
+                    Text("添加其他平台账号")
+                }
             }
+        }
+    }
+
+    // 排序模式下单击卡片 → 编辑备注（展示在手机号后面）
+    remarkTarget?.let { acc ->
+        OverlayDialog(
+            title = "编辑备注",
+            summary = "显示在手机号后面，最多 10 个字符（中文按 2 个计）",
+            show = true,
+            onDismissRequest = { remarkTarget = null },
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                TextField(
+                    value = remarkField,
+                    onValueChange = { new ->
+                        if (remarkLength(new) <= 10) remarkField = new
+                    },
+                    label = "备注",
+                    useLabelAsPlaceholder = true,
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp)),
+                )
+                Text(
+                    text = "${remarkLength(remarkField)}/10",
+                    fontSize = 11.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.align(Alignment.End),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            onUpdateRemark(acc.platform, acc.uid, remarkField.trim())
+                            remarkTarget = null
+                        },
+                    ) {
+                        Text("确认")
+                    }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { remarkTarget = null },
+                    ) {
+                        Text("取消")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 三横杠拖动把手：按住可拖动排序。 */
+@Composable
+private fun DragHandle(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .size(24.dp)
+            .semantics { contentDescription = "拖动排序" },
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        repeat(3) {
+            Box(
+                modifier = Modifier
+                    .width(16.dp)
+                    .height(2.dp)
+                    .background(
+                        MiuixTheme.colorScheme.onBackgroundVariant,
+                        RoundedCornerShape(1.dp),
+                    ),
+            )
+            if (it < 2) Spacer(Modifier.height(4.dp))
         }
     }
 }
@@ -1010,9 +1441,19 @@ private fun AccountCard(
     account: UniAccount,
     roles: List<GameRoleRow>?,
     rolesLoading: Boolean,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onOpenGame: (GameRoleRow) -> Unit,
+    reorderMode: Boolean = false,
+    onEnterReorder: () -> Unit = {},
+    onRemark: () -> Unit = {},
+    onHandleDragStart: () -> Unit = {},
+    onHandleDrag: (Float) -> Unit = {},
+    onHandleDragEnd: () -> Unit = {},
+    dragTranslationY: Float? = null,
+    showPhone: Boolean = false,
 ) {
     // 默认收起；箭头朝右（▷），展开时顺时针旋转 90° 朝下（∨）
-    var expanded by remember(account.platform, account.uid) { mutableStateOf(false) }
     val chevronRotation by animateFloatAsState(
         targetValue = if (expanded) 90f else 0f,
         animationSpec = tween(240),
@@ -1020,18 +1461,31 @@ private fun AccountCard(
     )
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (dragTranslationY != null) {
+                    Modifier.graphicsLayer { translationY = dragTranslationY }
+                } else {
+                    Modifier
+                },
+            ),
         insideMargin = PaddingValues(16.dp),
     ) {
-        // 头部：原样式（图标 + 昵称胶囊 + uid 小字）+ 右侧旋转箭头，整行点击切换（无按压水波/阴影）
+        // 头部：图标 + 昵称 + uid + 平台胶囊；点按展开，排序模式单击编辑备注，
+        // 右侧三横杠把手按住拖动排序
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(
+                .combinedClickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
-                ) { expanded = !expanded },
+                    onClick = {
+                        if (reorderMode) onRemark() else onToggle()
+                    },
+                    onLongClick = { if (!reorderMode) onEnterReorder() },
+                ),
         ) {
             AccountAvatar(account)
             Spacer(Modifier.width(12.dp))
@@ -1042,30 +1496,72 @@ private fun AccountCard(
                         fontSize = 16.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Spacer(Modifier.width(8.dp))
-                    PlatformBadge(account.platform)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = account.uid,
+                        fontSize = 13.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    )
+                    if (!reorderMode) {
+                        Spacer(Modifier.width(8.dp))
+                        PlatformBadge(account.platform)
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
+                // 第二行：手机号（默认掩码，眼睛睁开显示全文）+ 备注；无手机号时显示原 meta
+                val phoneDisplay = if (account.phone.isNotBlank()) {
+                    if (showPhone) account.phone else maskPhone(account.phone)
+                } else {
+                    account.meta
+                }
                 Text(
-                    text = "${account.uid} · ${account.meta}",
+                    text = if (account.remark.isNotBlank()) {
+                        "$phoneDisplay · ${account.remark}"
+                    } else {
+                        phoneDisplay
+                    },
                     fontSize = 12.sp,
                     color = MiuixTheme.colorScheme.onBackgroundVariant,
                 )
             }
             Spacer(Modifier.width(8.dp))
-            Icon(
-                imageVector = MiuixIcons.ChevronForward,
-                contentDescription = if (expanded) "收起角色" else "展开角色",
-                tint = MiuixTheme.colorScheme.onBackgroundVariant,
-                modifier = Modifier
-                    .size(20.dp)
-                    .rotate(chevronRotation),
-            )
+            if (reorderMode) {
+                // 排序模式：三横杠拖动把手（平常不显示）。
+                // rememberUpdatedState：pointerInput 只在 key 变化时重启，
+                // 需要把最新回调引进手势闭包，否则拖动读到的是旧 workingOrder。
+                val dragStart by rememberUpdatedState(onHandleDragStart)
+                val dragMove by rememberUpdatedState(onHandleDrag)
+                val dragEnd by rememberUpdatedState(onHandleDragEnd)
+                DragHandle(
+                    modifier = Modifier.pointerInput(account.platform + account.uid) {
+                        detectDragGestures(
+                            onDragStart = { dragStart() },
+                            onDrag = { _, amount -> dragMove(amount.y) },
+                            onDragEnd = { dragEnd() },
+                            onDragCancel = { dragEnd() },
+                        )
+                    },
+                )
+            } else {
+                Icon(
+                    imageVector = MiuixIcons.ChevronForward,
+                    contentDescription = if (expanded) "收起角色" else "展开角色",
+                    tint = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier
+                        .size(20.dp)
+                        .rotate(chevronRotation),
+                )
+            }
         }
 
-        // 展开区：角色行（缩进与昵称对齐），区分加载/空态/数据
+        // 展开区：每个游戏一张大卡片（左侧图标），点进详情页；区分加载/空态/数据
         AnimatedVisibility(visible = expanded) {
-            Column(modifier = Modifier.padding(start = 58.dp, top = 14.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 when {
                     roles == null && rolesLoading -> Text(
                         text = "正在获取角色数据…",
@@ -1077,31 +1573,300 @@ private fun AccountCard(
                         fontSize = 12.sp,
                         color = MiuixTheme.colorScheme.onBackgroundVariant,
                     )
-                    else -> roles.forEachIndexed { index, row ->
-                        if (index > 0) Spacer(Modifier.height(10.dp))
-                        Row(modifier = Modifier.fillMaxWidth()) {
+                    else -> roles.forEach { row ->
+                        GameCardItem(row = row, onClick = { onOpenGame(row) })
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 展开区的游戏大卡片：左侧游戏图标 + 游戏名/区服昵称 + 等级 + 右箭头，点击进详情。 */
+@Composable
+private fun GameCardItem(
+    row: GameRoleRow,
+    onClick: () -> Unit,
+) {
+    // 用 miuix 交互版 Card：按压反馈（水波/缩放）跟随卡片圆角；
+    // 外层 clickable 的 ripple 是矩形，会露出不带圆角的“阴影”。
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        insideMargin = PaddingValues(12.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            GameIcon(
+                url = row.iconUrl,
+                name = row.gameName,
+                modifier = Modifier.size(44.dp),
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = row.gameName,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                if (row.subText.isNotBlank()) {
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        text = row.subText,
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    )
+                }
+            }
+            if (row.levelText.isNotBlank()) {
+                Text(
+                    text = row.levelText,
+                    fontSize = 13.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                )
+                Spacer(Modifier.width(6.dp))
+            }
+            Icon(
+                imageVector = MiuixIcons.ChevronForward,
+                contentDescription = "查看详情",
+                tint = MiuixTheme.colorScheme.onBackgroundVariant,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+/** 游戏图标（官方 icon URL）；无图时用游戏名首字兜底。 */
+@Composable
+private fun GameIcon(
+    url: String,
+    name: String,
+    modifier: Modifier = Modifier,
+) {
+    if (url.isNotBlank()) {
+        AsyncImage(
+            model = url,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = modifier.clip(RoundedCornerShape(10.dp)),
+        )
+    } else {
+        Box(
+            modifier = modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(MiuixTheme.colorScheme.primary.copy(alpha = 0.15f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = name.take(1),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MiuixTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+/** 游戏详情页（二级页面）：头部卡片 + 统计网格（体力/活跃天数/已解锁角色…）。 */
+@Composable
+private fun GameDetailPage(
+    row: GameRoleRow,
+    session: AuthSession?,
+    nestedScroll: NestedScrollConnection,
+) {
+    // 角色列表（森空岛 card/detail）：进入页面拉取，空=不支持或无数据
+    var chars by remember(row) { mutableStateOf<List<GameCharRow>?>(null) }
+    LaunchedEffect(row, session) {
+        if (session == null || row.platform != "skland" || row.gameKey.isBlank()) {
+            chars = emptyList()
+        } else {
+            chars = AuthApi.fetchSklandCharList(session, row)
+        }
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(nestedScroll)
+            .padding(horizontal = 20.dp),
+        contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        // 头部：图标 + 游戏名 + 等级 + 区服·昵称
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                insideMargin = PaddingValues(16.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    GameIcon(
+                        url = row.iconUrl,
+                        name = row.gameName,
+                        modifier = Modifier.size(56.dp),
+                    )
+                    Spacer(Modifier.width(14.dp))
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = row.gameName,
-                                fontSize = 13.sp,
-                                modifier = Modifier.weight(1f),
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.SemiBold,
                             )
-                            Text(
-                                text = row.levelText,
-                                fontSize = 13.sp,
-                                modifier = Modifier.weight(1f),
-                            )
+                            if (row.levelText.isNotBlank()) {
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = row.levelText,
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                                )
+                            }
                         }
                         if (row.subText.isNotBlank()) {
-                            Spacer(Modifier.height(2.dp))
+                            Spacer(Modifier.height(4.dp))
                             Text(
                                 text = row.subText,
-                                fontSize = 11.sp,
+                                fontSize = 12.sp,
                                 color = MiuixTheme.colorScheme.onBackgroundVariant,
                             )
                         }
                     }
                 }
             }
+        }
+        // 统计网格：两列
+        if (row.stats.isNotEmpty()) {
+            item {
+                Text(
+                    text = "概览",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+            }
+            items(row.stats.chunked(2)) { pair ->
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    pair.forEach { stat ->
+                        StatCard(stat = stat, modifier = Modifier.weight(1f))
+                    }
+                    if (pair.size == 1) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+        } else {
+            item {
+                Text(
+                    text = "暂无统计数据",
+                    fontSize = 12.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+            }
+        }
+        // 角色列表（森空岛 card/detail）：加载中 / 空态不显示 / 列表
+        when {
+            chars == null -> item {
+                Text(
+                    text = "正在获取角色列表…",
+                    fontSize = 12.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+            }
+            !chars.isNullOrEmpty() -> {
+                item {
+                    Text(
+                        text = "角色列表 · ${chars!!.size}",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                }
+                items(chars!!, key = { it.name }) { c ->
+                    CharRowItem(c)
+                }
+            }
+        }
+    }
+}
+
+/** 详情页角色行：头像 + 名字 + 稀有度 + 职业/属性 + 等级。 */
+@Composable
+private fun CharRowItem(c: GameCharRow) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        insideMargin = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            GameIcon(
+                url = c.avatarUrl,
+                name = c.name,
+                modifier = Modifier.size(44.dp),
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = c.name,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    if (c.rarity > 0) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "★".repeat(c.rarity.coerceAtMost(6)),
+                            fontSize = 12.sp,
+                            color = MiuixTheme.colorScheme.onBackgroundVariant,
+                        )
+                    }
+                }
+                val sub = listOf(c.profession, c.property).filter(String::isNotBlank)
+                    .joinToString(" · ")
+                if (sub.isNotBlank()) {
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        text = sub,
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    )
+                }
+            }
+            if (c.level > 0) {
+                Text(
+                    text = "Lv.${c.level}",
+                    fontSize = 13.sp,
+                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatCard(
+    stat: GameStat,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier,
+        insideMargin = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+    ) {
+        Column {
+            Text(
+                text = stat.label,
+                fontSize = 11.sp,
+                color = MiuixTheme.colorScheme.onBackgroundVariant,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stat.value,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
     }
 }
@@ -1155,6 +1920,8 @@ private fun PlatformBadge(platform: String) {
         color = color,
         fontSize = 11.sp,
         fontWeight = FontWeight.Medium,
+        maxLines = 1,
+        softWrap = false,
         modifier = Modifier
             .background(color.copy(alpha = 0.12f), RoundedCornerShape(50))
             .padding(horizontal = 8.dp, vertical = 3.dp),
@@ -1175,6 +1942,8 @@ private fun ScanPage(
     var scannedRaw by remember { mutableStateOf<String?>(null) }
     var cameraOn by remember { mutableStateOf(false) }
     var confirming by remember { mutableStateOf(false) }
+    // 多账号时选择用哪个账号确认换端（单账号自动选中）
+    var selectedScanUid by remember { mutableStateOf<String?>(null) }
     // 库街区扫码二次验证状态：idle=未开始，sms=已发码等待输入
     var kuroStage by remember { mutableStateOf("idle") }
     var kuroCode by remember { mutableStateOf("") }
@@ -1186,6 +1955,7 @@ private fun ScanPage(
         kuroStage = "idle"
         kuroCode = ""
         kuroRoles = emptyList()
+        selectedScanUid = null
     }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -1216,6 +1986,11 @@ private fun ScanPage(
             scannedRaw = raw
             cameraOn = false
             onScanPlatformChange(detected)
+            // 单账号直接预选；多账号等待用户在弹窗里选择
+            selectedScanUid = accounts
+                .filter { it.platform == detected }
+                .singleOrNull()
+                ?.uid
         }
     }
 
@@ -1347,8 +2122,11 @@ private fun ScanPage(
             }
         }
 
+        // 同平台候选账号：多账号时按用户选择，单账号默认选中
+        val scanCandidates = accounts.filter { it.platform == scanPlatform }
         val scannedAccount = scannedRaw?.let {
-            accounts.firstOrNull { a -> a.platform == scanPlatform }
+            scanCandidates.firstOrNull { a -> a.uid == selectedScanUid }
+                ?: scanCandidates.singleOrNull()
         }
         val deviceName = when (scanPlatform) {
             "skland" -> "森空岛网站 · 扫码登录"
@@ -1410,7 +2188,11 @@ private fun ScanPage(
                             text = "确认登录",
                             enabled = kuroCode.length == 6 && !confirming,
                             onClick = {
-                                val session = sessions.firstOrNull { it.platform == "kuro" }
+                                val session = scannedAccount?.let { acc ->
+                                    sessions.find {
+                                        it.platform == acc.platform && it.uid == acc.uid
+                                    }
+                                } ?: sessions.firstOrNull { it.platform == "kuro" }
                                 val raw = scannedRaw ?: return@TextButton
                                 if (session == null) {
                                     onToast("未找到库街区账号，请先登录")
@@ -1456,18 +2238,75 @@ private fun ScanPage(
                         )
                     }
                 } else {
-                    Text(
-                        text = "登录账号",
-                        fontSize = 13.sp,
-                        color = MiuixTheme.colorScheme.onBackgroundVariant,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = scannedAccount?.name.orEmpty() + " · " + scannedAccount?.uid.orEmpty(),
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(20.dp))
+                    if (scanCandidates.size > 1) {
+                        Text(
+                            text = "选择登录账号",
+                            fontSize = 13.sp,
+                            color = MiuixTheme.colorScheme.onBackgroundVariant,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        scanCandidates.forEach { cand ->
+                            val selected = cand.uid == selectedScanUid
+                            val radioColor = if (selected) {
+                                MiuixTheme.colorScheme.primary
+                            } else {
+                                MiuixTheme.colorScheme.onBackgroundVariant
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { selectedScanUid = cand.uid }
+                                    .padding(vertical = 8.dp, horizontal = 4.dp),
+                            ) {
+                                // 单选圆点
+                                Box(
+                                    modifier = Modifier.size(20.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(18.dp)
+                                            .border(1.5.dp, radioColor, CircleShape),
+                                    )
+                                    if (selected) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(10.dp)
+                                                .background(radioColor, CircleShape),
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    text = cand.name,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = cand.uid,
+                                    fontSize = 12.sp,
+                                    color = MiuixTheme.colorScheme.onBackgroundVariant,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(14.dp))
+                    } else {
+                        Text(
+                            text = "登录账号",
+                            fontSize = 13.sp,
+                            color = MiuixTheme.colorScheme.onBackgroundVariant,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = scannedAccount?.name.orEmpty() + " · " + scannedAccount?.uid.orEmpty(),
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.height(20.dp))
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         TextButton(
                             text = "拒绝",
@@ -1476,10 +2315,14 @@ private fun ScanPage(
                         )
                         TextButton(
                             text = "同意登录",
-                            // 防重复提交：请求进行中禁用，避免重复调 qrCode/scan 扰乱服务端状态
-                            enabled = !confirming,
+                            // 防重复提交 + 多账号时必须先选择
+                            enabled = !confirming && (scanCandidates.size == 1 || selectedScanUid != null),
                             onClick = {
-                                val session = sessions.firstOrNull { it.platform == scanPlatform }
+                                val session = scannedAccount?.let { acc ->
+                                    sessions.find {
+                                        it.platform == acc.platform && it.uid == acc.uid
+                                    }
+                                } ?: sessions.firstOrNull { it.platform == scanPlatform }
                                 val raw = scannedRaw ?: return@TextButton
                                 confirming = true
                                 if (session == null) {
@@ -1994,12 +2837,12 @@ private fun SettingsPage(
     onOpenSync: () -> Unit,
     onOpenAbout: () -> Unit,
     onToast: (String) -> Unit,
-    onLogout: (String?) -> Unit,
+    onLogout: (String?, String?) -> Unit,
     nestedScroll: NestedScrollConnection,
 ) {
     var showLogout by remember { mutableStateOf(false) }
     // null=未选择, Pair(null,null)=退出全部, Pair(platform,name)=退出单个
-    var pendingLogout by remember { mutableStateOf<Pair<String?, String>?>(null) }
+    var pendingLogout by remember { mutableStateOf<Triple<String?, String, String>?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -2052,7 +2895,7 @@ private fun SettingsPage(
                         summary = "${platformLabel(account.platform)} · ${account.uid}",
                         onClick = {
                             showLogout = false
-                            pendingLogout = account.platform to account.name
+                            pendingLogout = Triple(account.platform, account.uid, account.name)
                         },
                     )
                 }
@@ -2062,7 +2905,7 @@ private fun SettingsPage(
                     text = "退出全部账号",
                     onClick = {
                         showLogout = false
-                        pendingLogout = null to "全部账号"
+                        pendingLogout = Triple(null, "", "全部账号")
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -2076,7 +2919,7 @@ private fun SettingsPage(
         }
 
         // 第二步：二次确认
-        pendingLogout?.let { (platform, name) ->
+        pendingLogout?.let { (platform, uid, name) ->
             ConfirmDialog(
                 show = true,
                 title = "退出登录",
@@ -2087,7 +2930,7 @@ private fun SettingsPage(
                 },
                 confirmText = "退出",
                 onConfirm = {
-                    onLogout(platform)
+                    onLogout(platform, uid.ifBlank { null })
                     onToast(if (platform == null) "已退出全部账号" else "已退出 $name")
                     pendingLogout = null
                 },

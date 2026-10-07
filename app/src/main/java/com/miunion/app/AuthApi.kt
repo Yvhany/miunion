@@ -31,6 +31,12 @@ data class AuthSession(
     val nickname: String = "",
     val expiresAt: Long = 0L,
     val savedAt: Long = 0L,
+    /** 账号库展示顺序（越小越靠前）；旧数据缺省 -1，读取时按当前序补齐。 */
+    val sortOrder: Int = -1,
+    /** 登录手机号（短信登录时记录；扫码/同步来的账号可能为空）。 */
+    val phone: String = "",
+    /** 账号备注（账号卡第二行手机号后展示；中文按 2 字符计、限 10）。 */
+    val remark: String = "",
 )
 
 sealed class AuthResult {
@@ -38,11 +44,37 @@ sealed class AuthResult {
     data class Error(val message: String) : AuthResult()
 }
 
-/** 账号下游戏角色展示行（森空岛 user/center / 米游社 game record）。 */
+/** 游戏详情页的一项统计数据（体力/活跃天数/已解锁角色等）。 */
+data class GameStat(
+    val label: String,
+    val value: String,
+)
+
+/** 账号下游戏角色卡（森空岛 user/center / 米游社 game record）。 */
 data class GameRoleRow(
     val gameName: String,
     val levelText: String,
     val subText: String = "",
+    val iconUrl: String = "",
+    val stats: List<GameStat> = emptyList(),
+    val platform: String = "",
+    /** 米游社 role 定位：region(prod_gf_cn/cn_gf01…) 与 game_role_id，详情接口用。 */
+    val server: String = "",
+    val roleId: String = "",
+    /** 森空岛 appCode（endfield/arknights…）与绑定定位（serverId/userId），详情接口用。 */
+    val gameKey: String = "",
+    val serverId: String = "",
+    val userId: String = "",
+)
+
+/** 游戏详情页的干员/角色行（森空岛 card/detail：头像+稀有度+职业+属性+等级）。 */
+data class GameCharRow(
+    val name: String,
+    val avatarUrl: String = "",
+    val rarity: Int = 0,
+    val profession: String = "",
+    val property: String = "",
+    val level: Int = 0,
 )
 
 /** 库街区发短信结果（抓包：getSmsCode 返回 geeTest=true 表示需先过极验，短信未发出）。 */
@@ -62,30 +94,17 @@ object AuthStore {
     private const val FILE = "auth_sessions.json"
 
     fun load(context: Context): MutableList<AuthSession> = try {
-        val text = context.openFileInput(FILE).bufferedReader().use { it.readText() }
-        val raw = JSONObject(text).opt("sessions")
-        val arr = if (raw is JSONArray) raw else JSONArray(raw.toString())
-        (0 until arr.length()).map { i ->
-            val o = arr.getJSONObject(i)
-            AuthSession(
-                platform = o.optString("platform"),
-                uid = o.optString("uid"),
-                mid = o.optString("mid"),
-                stoken = o.optString("stoken"),
-                ltoken = o.optString("ltoken"),
-                cookieToken = o.optString("cookieToken"),
-                authToken = o.optString("authToken"),
-                cred = o.optString("cred"),
-                nickname = o.optString("nickname"),
-                expiresAt = o.optLong("expiresAt"),
-                savedAt = o.optLong("savedAt"),
-            )
-        }.toMutableList()
+        parse(context.openFileInput(FILE).bufferedReader().use { it.readText() })
     } catch (e: Exception) {
         mutableListOf()
     }
 
     fun save(context: Context, sessions: List<AuthSession>) {
+        context.openFileOutput(FILE, Context.MODE_PRIVATE).bufferedWriter().use { it.write(serialize(sessions)) }
+    }
+
+    /** 序列化为 {"sessions":[…]} JSON（本地备份导出复用）。 */
+    fun serialize(sessions: List<AuthSession>): String {
         val array = JSONArray()
         sessions.forEach { s ->
             array.put(
@@ -101,11 +120,117 @@ object AuthStore {
                     put("nickname", s.nickname)
                     put("expiresAt", s.expiresAt)
                     put("savedAt", s.savedAt)
+                    put("sortOrder", s.sortOrder)
+                    put("phone", s.phone)
+                    put("remark", s.remark)
                 }
             )
         }
-        val root = JSONObject().put("sessions", array)
-        context.openFileOutput(FILE, Context.MODE_PRIVATE).bufferedWriter().use { it.write(root.toString()) }
+        return JSONObject().put("sessions", array).toString()
+    }
+
+    /** 解析 serialize/load 产生的 JSON（备份文件里 sessions 字段同样适用）。 */
+    fun parse(text: String): MutableList<AuthSession> {
+        val raw = JSONObject(text).opt("sessions")
+        val arr = if (raw is JSONArray) raw else JSONArray(raw.toString())
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            AuthSession(
+                platform = o.optString("platform"),
+                uid = o.optString("uid"),
+                mid = o.optString("mid"),
+                stoken = o.optString("stoken"),
+                ltoken = o.optString("ltoken"),
+                cookieToken = o.optString("cookieToken"),
+                authToken = o.optString("authToken"),
+                cred = o.optString("cred"),
+                nickname = o.optString("nickname"),
+                expiresAt = o.optLong("expiresAt"),
+                savedAt = o.optLong("savedAt"),
+                sortOrder = if (o.has("sortOrder")) o.optInt("sortOrder") else i,
+                phone = o.optString("phone"),
+                remark = o.optString("remark"),
+            )
+        }.toMutableList()
+    }
+}
+
+/**
+ * 角色概览持久缓存：进账号库先显示上次结果，联网拉取成功后覆盖；
+ * 拉取失败（全空）不覆盖，避免“用完就没”。
+ */
+object RoleCache {
+    private const val FILE = "role_cache.json"
+
+    fun load(context: Context): Map<String, List<GameRoleRow>> = try {
+        val text = context.openFileInput(FILE).bufferedReader().use { it.readText() }
+        val o = JSONObject(text)
+        val out = mutableMapOf<String, List<GameRoleRow>>()
+        val keys = o.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val arr = o.optJSONArray(k) ?: continue
+            out[k] = (0 until arr.length()).mapNotNull { i ->
+                val r = arr.optJSONObject(i) ?: return@mapNotNull null
+                val statsArr = r.optJSONArray("stats")
+                val stats = buildList {
+                    if (statsArr != null) {
+                        for (j in 0 until statsArr.length()) {
+                            val s = statsArr.optJSONObject(j) ?: continue
+                            add(GameStat(s.optString("l"), s.optString("v")))
+                        }
+                    }
+                }
+                GameRoleRow(
+                    gameName = r.optString("gameName"),
+                    levelText = r.optString("levelText"),
+                    subText = r.optString("subText"),
+                    iconUrl = r.optString("iconUrl"),
+                    stats = stats,
+                    platform = r.optString("platform"),
+                    server = r.optString("server"),
+                    roleId = r.optString("roleId"),
+                    gameKey = r.optString("gameKey"),
+                    serverId = r.optString("serverId"),
+                    userId = r.optString("userId"),
+                )
+            }
+        }
+        out
+    } catch (e: Exception) {
+        emptyMap()
+    }
+
+    fun save(context: Context, map: Map<String, List<GameRoleRow>>) {
+        val o = JSONObject()
+        map.forEach { (k, rows) ->
+            val arr = JSONArray()
+            rows.forEach { r ->
+                arr.put(
+                    JSONObject()
+                        .put("gameName", r.gameName)
+                        .put("levelText", r.levelText)
+                        .put("subText", r.subText)
+                        .put("iconUrl", r.iconUrl)
+                        .put("platform", r.platform)
+                        .put("server", r.server)
+                        .put("roleId", r.roleId)
+                        .put("gameKey", r.gameKey)
+                        .put("serverId", r.serverId)
+                        .put("userId", r.userId)
+                        .put(
+                            "stats",
+                            JSONArray().also { sa ->
+                                r.stats.forEach { s ->
+                                    sa.put(JSONObject().put("l", s.label).put("v", s.value))
+                                }
+                            },
+                        ),
+                )
+            }
+            o.put(k, arr)
+        }
+        context.openFileOutput(FILE, Context.MODE_PRIVATE).bufferedWriter().use { it.write(o.toString()) }
     }
 }
 
@@ -487,8 +612,16 @@ object AuthApi {
     private fun parseRetcode(resp: String): AuthResult =
         try {
             val o = JSONObject(resp)
-            if (o.optInt("retcode") != 0 && o.optInt("status") != 0 && o.optInt("code") != 0) {
-                AuthResult.Error(o.optString("message", o.optString("msg", "请求失败")))
+            // 只检查实际存在的字段：此前 status 缺失时 optInt=0 使条件恒假，
+            // 米游社 -3101「请求频繁」也被误判成功（短信没发却提示已发送）。
+            val failed = (o.has("retcode") && o.optInt("retcode") != 0) ||
+                (o.has("status") && o.optInt("status") != 0) ||
+                (o.has("code") && o.optInt("code") != 0)
+            if (failed) {
+                AuthResult.Error(
+                    o.optString("message").ifBlank { o.optString("msg") }
+                        .ifBlank { "请求失败" }
+                )
             } else {
                 AuthResult.Success(AuthSession("", "", ""))
             }
@@ -829,6 +962,13 @@ object AuthApi {
         "skland" -> loginSkland(phone, code)
         "kuro" -> loginKuro(phone, code)
         else -> loginMihoyo(phone, code)
+    }.let { r ->
+        // 短信登录记住手机号（账号库/同步展示用）
+        if (r is AuthResult.Success && phone.length == 11 && r.session.phone.isBlank()) {
+            AuthResult.Success(r.session.copy(phone = phone))
+        } else {
+            r
+        }
     }
 
     // ---- 角色数据（报文来自 2026-10-07 抓包 HAR，链路已实测 retcode=0） ----
@@ -840,6 +980,13 @@ object AuthApi {
     private val sklandRid = randomHex(20)
 
     private fun seconds(): String = (System.currentTimeMillis() / 1000).toString()
+
+    /** 秒数 → 「X小时Y分」/「Y分钟」（体力回满倒计时用）。 */
+    private fun durText(totalSec: Long): String {
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        return if (h > 0) "${h}小时${m}分" else "${m}分钟"
+    }
 
     private fun dsCn(query: String): String {
         val t = seconds()
@@ -870,7 +1017,7 @@ object AuthApi {
         "is_new_tiger" to "1",
     )
 
-    /** 米游社游戏记录卡（getGameRecordCard wapi 形态；头按抓包 ct5 WebView 样本）。 */
+    /** 米游社游戏记录卡（api 路径；头按抓包 ct5 WebView 样本）。 */
     suspend fun fetchMihoyoGameRecord(session: AuthSession): List<GameRoleRow> =
         withContext(Dispatchers.IO) {
             try {
@@ -896,8 +1043,9 @@ object AuthApi {
                     "X-Requested-With" to "com.mihoyo.hyperion",
                     "Accept" to "application/json, text/plain, */*",
                 )
+                // wapi 路径实测 10001 Please login（2026-10-08），旧 api 路径正常
                 val resp = get(
-                    "https://api-takumi-record.mihoyo.com/game_record/app/card/wapi/getGameRecordCard?$q",
+                    "https://api-takumi-record.mihoyo.com/game_record/app/card/api/getGameRecordCard?$q",
                     headers,
                 )
                 val o = JSONObject(resp)
@@ -908,10 +1056,26 @@ object AuthApi {
                     if (!it.optBoolean("has_role")) return@mapNotNull null
                     val sub = listOf(it.optString("region_name"), it.optString("nickname"))
                         .filter(String::isNotBlank).joinToString(" · ")
+                    // data[]：活跃天数 / 已解锁角色 / 达成成就数…（label→value 统计对）
+                    val dataArr = it.optJSONArray("data")
+                    val stats = buildList {
+                        if (dataArr != null) {
+                            for (j in 0 until dataArr.length()) {
+                                val d = dataArr.optJSONObject(j) ?: continue
+                                val label = d.optString("name")
+                                if (label.isNotBlank()) add(GameStat(label, d.optString("value")))
+                            }
+                        }
+                    }
                     GameRoleRow(
                         gameName = it.optString("game_name"),
                         levelText = "Lv.${it.optInt("level")}",
                         subText = sub,
+                        iconUrl = it.optString("logo"),
+                        stats = stats.filter { s -> s.value.isNotBlank() },
+                        platform = "mihoyo",
+                        server = it.optString("region"),
+                        roleId = it.optString("game_role_id"),
                     )
                 }
             } catch (e: Exception) {
@@ -935,7 +1099,152 @@ object AuthApi {
                 val token = JSONObject(refreshResp).optJSONObject("data")?.optString("token").orEmpty()
                 if (token.isBlank()) return@withContext emptyList()
 
-                val path = "/api/v1/user/center"
+                // 签名 GET（app 端：msg = path + query + ts + ca）
+                suspend fun signedGet(path: String, query: String = ""): JSONObject? {
+                    val ts = seconds()
+                    val ca = JSONObject()
+                        .put("platform", "1")
+                        .put("timestamp", ts)
+                        .put("dId", sklandDid)
+                        .put("vName", "2.0.0")
+                        .toString()
+                    val sign = md5(hmacSha256Hex(token, "$path$query$ts$ca"))
+                    val headers = (sklandBaseHeaders() - "is_new_tiger") + mapOf(
+                        "timestamp" to ts,
+                        "cred" to session.cred,
+                        "sign" to sign,
+                    )
+                    val resp = get("https://zonai.skland.com$path$query", headers)
+                    val o = JSONObject(resp)
+                    return if (o.optInt("code") == 0) o else null
+                }
+
+                val center = signedGet("/api/v1/user/center") ?: return@withContext emptyList()
+                val data = center.optJSONObject("data") ?: return@withContext emptyList()
+                // 森空岛平台 userId（card/detail 查询参数之一）
+                val platformUserId = data.optJSONObject("userInfo")?.optJSONObject("user")?.optString("id").orEmpty()
+                val cards = data.optJSONArray("gameCardList") ?: return@withContext emptyList()
+
+                // binding：appCode → 默认角色（roleId/serverId），card/detail 定位用
+                val bindingMap = mutableMapOf<String, Pair<String, String>>()
+                signedGet("/api/v1/game/player/binding")?.let { b ->
+                    val list = b.optJSONObject("data")?.optJSONArray("list")
+                    if (list != null) {
+                        for (i in 0 until list.length()) {
+                            val g = list.optJSONObject(i) ?: continue
+                            val appCode = g.optString("appCode")
+                            val bl = g.optJSONArray("bindingList") ?: continue
+                            for (j in 0 until bl.length()) {
+                                val bind = bl.optJSONObject(j) ?: continue
+                                if (bind.optBoolean("isDelete")) continue
+                                val roles = bind.optJSONArray("roles")
+                                if (roles != null && roles.length() > 0) {
+                                    val role = roles.optJSONObject(0) ?: continue
+                                    bindingMap.putIfAbsent(
+                                        appCode,
+                                        role.optString("roleId") to role.optString("serverId"),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                (0 until cards.length()).mapNotNull { i ->
+                    val card = cards.optJSONObject(i) ?: return@mapNotNull null
+                    // 内嵌游戏卡（arknights/endfield…）：含 level/name 的那个 JSONObject；
+                    // 其 key 即 appCode
+                    var inner: JSONObject? = null
+                    var gameKey = ""
+                    val keys = card.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val v = card.opt(k)
+                        if (v is JSONObject && v.has("level")) {
+                            inner = v
+                            gameKey = k
+                            break
+                        }
+                    }
+                    val inn = inner ?: return@mapNotNull null
+                    val level = inn.optInt("level")
+                    val charName = inn.optString("name")
+                    val server = inn.optString("serverName")
+                    val sub = listOf(charName, server).filter(String::isNotBlank).joinToString(" · ")
+                    val stats = buildList {
+                        // 体力（明日方舟理智）：current/max + 回满秒数（实测=剩余秒数）
+                        val ap = inn.optJSONObject("ap")
+                        if (ap != null) {
+                            val cur = ap.optInt("current")
+                            val max = ap.optInt("max")
+                            if (max > 0) add(GameStat("体力", "$cur / $max"))
+                            val recovery = ap.optLong("completeRecoveryTime")
+                            if (cur < max && recovery > 0) add(GameStat("回满预计", durText(recovery)))
+                        }
+                        val charCnt = when {
+                            inn.has("charCnt") -> inn.optInt("charCnt")
+                            inn.has("charCount") -> inn.optInt("charCount")
+                            else -> -1
+                        }
+                        if (charCnt >= 0) add(GameStat("已解锁角色", charCnt.toString()))
+                        if (inn.has("achievementCount")) {
+                            add(GameStat("达成成就", inn.optInt("achievementCount").toString()))
+                        }
+                        if (inn.has("skinCnt")) add(GameStat("皮肤数", inn.optInt("skinCnt").toString()))
+                        val main = inn.optString("mainStageProgress")
+                        if (main.isNotBlank()) add(GameStat("主线进度", main))
+                        val regTs = listOf(inn.optString("registerTs"), inn.optString("createdAtTs"))
+                            .firstOrNull { s -> s.isNotBlank() && s != "0" }
+                            ?.toLongOrNull()
+                        if (regTs != null) {
+                            val days = ((System.currentTimeMillis() / 1000 - regTs) / 86400)
+                                .coerceAtLeast(0)
+                            add(GameStat("活跃天数", days.toString()))
+                        }
+                    }
+                    val binding = bindingMap[gameKey]
+                    GameRoleRow(
+                        gameName = card.optString("name"),
+                        levelText = "Lv.$level",
+                        subText = sub,
+                        iconUrl = card.optString("icon"),
+                        stats = stats,
+                        platform = "skland",
+                        gameKey = gameKey,
+                        roleId = binding?.first.orEmpty(),
+                        serverId = binding?.second.orEmpty(),
+                        userId = platformUserId,
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    /**
+     * 森空岛游戏详情的干员/角色列表：card/detail（报文来自 2026-10-07 HAR，
+     * 路径 /api/v1/game/{gameKey}/card/detail?roleId&serverId&userId，已实测 code=0）。
+     * 仅 gameKey 非空且绑定角色齐全时可用。
+     */
+    suspend fun fetchSklandCharList(session: AuthSession, row: GameRoleRow): List<GameCharRow> =
+        withContext(Dispatchers.IO) {
+            try {
+                if (session.cred.isBlank() || row.gameKey.isBlank() ||
+                    row.roleId.isBlank() || row.userId.isBlank()
+                ) {
+                    return@withContext emptyList()
+                }
+                val refreshHeaders = sklandBaseHeaders() + mapOf(
+                    "timestamp" to seconds(),
+                    "cred" to session.cred,
+                )
+                val refreshResp = get("https://zonai.skland.com/api/v1/auth/refresh", refreshHeaders)
+                val token = JSONObject(refreshResp).optJSONObject("data")?.optString("token").orEmpty()
+                if (token.isBlank()) return@withContext emptyList()
+
+                val path = "/api/v1/game/${row.gameKey}/card/detail"
+                // 签名消息用不带"?"的 query，URL 才拼"?"（HAR 实测）
+                val query = "roleId=${row.roleId}&serverId=${row.serverId}&userId=${row.userId}"
                 val ts = seconds()
                 val ca = JSONObject()
                     .put("platform", "1")
@@ -943,38 +1252,27 @@ object AuthApi {
                     .put("dId", sklandDid)
                     .put("vName", "2.0.0")
                     .toString()
-                val sign = md5(hmacSha256Hex(token, "$path$ts$ca"))
+                val sign = md5(hmacSha256Hex(token, "$path$query$ts$ca"))
                 val headers = (sklandBaseHeaders() - "is_new_tiger") + mapOf(
                     "timestamp" to ts,
                     "cred" to session.cred,
                     "sign" to sign,
                 )
-                val resp = get("https://zonai.skland.com$path", headers)
+                val resp = get("https://zonai.skland.com$path?$query", headers)
                 val o = JSONObject(resp)
                 if (o.optInt("code") != 0) return@withContext emptyList()
-                val cards = o.optJSONObject("data")?.optJSONArray("gameCardList")
+                val chars = o.optJSONObject("data")?.optJSONObject("detail")?.optJSONArray("chars")
                     ?: return@withContext emptyList()
-                (0 until cards.length()).mapNotNull { i ->
-                    val card = cards.optJSONObject(i) ?: return@mapNotNull null
-                    var level = -1
-                    var charName = ""
-                    var server = ""
-                    val keys = card.keys()
-                    while (keys.hasNext()) {
-                        val v = card.opt(keys.next())
-                        if (v is JSONObject && v.has("level")) {
-                            level = v.optInt("level")
-                            charName = v.optString("name")
-                            server = v.optString("serverName")
-                            break
-                        }
-                    }
-                    if (level < 0 && charName.isBlank()) return@mapNotNull null
-                    val sub = listOf(charName, server).filter(String::isNotBlank).joinToString(" · ")
-                    GameRoleRow(
-                        gameName = card.optString("name"),
-                        levelText = if (level >= 0) "Lv.$level" else "",
-                        subText = sub,
+                (0 until chars.length()).mapNotNull { i ->
+                    val c = chars.optJSONObject(i) ?: return@mapNotNull null
+                    val cd = c.optJSONObject("charData") ?: return@mapNotNull null
+                    GameCharRow(
+                        name = cd.optString("name"),
+                        avatarUrl = cd.optString("avatarSqUrl").ifBlank { cd.optString("illustrationUrl") },
+                        rarity = cd.optJSONObject("rarity")?.optInt("value") ?: 0,
+                        profession = cd.optJSONObject("profession")?.optString("value").orEmpty(),
+                        property = cd.optJSONObject("property")?.optString("value").orEmpty(),
+                        level = c.optInt("level"),
                     )
                 }
             } catch (e: Exception) {

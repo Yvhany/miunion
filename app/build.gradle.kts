@@ -12,8 +12,29 @@ android {
         applicationId = "com.miunion.app"
         minSdk = 24
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.1.0"
+        versionCode = 2
+        versionName = "2.0.0"
+    }
+
+    signingConfigs {
+        // 发布签名（keystore 不入库，见 .gitignore）
+        create("release") {
+            storeFile = file("${rootProject.projectDir}/release.keystore")
+            storePassword = "miunion2026"
+            keyAlias = "miunion"
+            keyPassword = "miunion2026"
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+            // 2.0.0 起发布 64 位（arm64-v8a / armeabi-v7a 合并为 armv8 版本仅保留 64 位）
+            ndk {
+                abiFilters += setOf("arm64-v8a")
+            }
+        }
     }
 
     compileOptions {
@@ -33,6 +54,7 @@ dependencies {
     implementation(libs.miuix.preference)
     implementation(libs.miuix.icons)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("androidx.camera:camera-camera2:1.4.1")
     implementation("androidx.camera:camera-lifecycle:1.4.1")
     implementation("androidx.camera:camera-view:1.4.1")

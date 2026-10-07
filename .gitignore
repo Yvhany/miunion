@@ -11,3 +11,7 @@ local.properties
 .idea/
 *.iml
 captures/
+
+# 签名私钥（勿入库）
+release.keystore
+*.jks
