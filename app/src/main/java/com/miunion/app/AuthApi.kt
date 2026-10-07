@@ -38,6 +38,13 @@ sealed class AuthResult {
     data class Error(val message: String) : AuthResult()
 }
 
+/** 账号下游戏角色展示行（森空岛 user/center / 米游社 game record）。 */
+data class GameRoleRow(
+    val gameName: String,
+    val levelText: String,
+    val subText: String = "",
+)
+
 /** 库街区发短信结果（抓包：getSmsCode 返回 geeTest=true 表示需先过极验，短信未发出）。 */
 sealed class SmsResult {
     object NeedCaptcha : SmsResult()
@@ -823,4 +830,155 @@ object AuthApi {
         "kuro" -> loginKuro(phone, code)
         else -> loginMihoyo(phone, code)
     }
+
+    // ---- 角色数据（报文来自 2026-10-07 抓包 HAR，链路已实测 retcode=0） ----
+
+    /** 米游社 cn 版 DS 盐（App WebView 形态：salt&t&r&b=&q=）。 */
+    private const val MIYO_CN_SALT = "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs"
+
+    private val sklandDid = randomHex(16)
+    private val sklandRid = randomHex(20)
+
+    private fun seconds(): String = (System.currentTimeMillis() / 1000).toString()
+
+    private fun dsCn(query: String): String {
+        val t = seconds()
+        val r = (100001..200000).random().toString()
+        return "$t,$r,${md5("salt=$MIYO_CN_SALT&t=$t&r=$r&b=&q=$query")}"
+    }
+
+    private fun hmacSha256Hex(key: String, msg: String): String {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(key.toByteArray(), "HmacSHA256"))
+        return mac.doFinal(msg.toByteArray()).joinToString("") { "%02x".format(it) }
+    }
+
+    /** 森空岛请求基础头（refresh 用；user/center 需另加 sign 并去掉 is_new_tiger）。 */
+    private fun sklandBaseHeaders(): Map<String, String> = mapOf(
+        "platform" to "1",
+        "did" to sklandDid,
+        "language" to "zh-cn",
+        "os" to "37",
+        "nid" to "1",
+        "vname" to "2.0.0",
+        "vcode" to "200000200",
+        "User-Agent" to "Skland/2.0.0 (com.hypergryph.skland; build:200000200; Android 37; ) Okhttp/4.11.0",
+        "channel" to "MS",
+        "manufacturer" to android.os.Build.MANUFACTURER,
+        "content-type" to "application/json",
+        "rid" to sklandRid,
+        "is_new_tiger" to "1",
+    )
+
+    /** 米游社游戏记录卡（getGameRecordCard wapi 形态；头按抓包 ct5 WebView 样本）。 */
+    suspend fun fetchMihoyoGameRecord(session: AuthSession): List<GameRoleRow> =
+        withContext(Dispatchers.IO) {
+            try {
+                val q = "uid=${session.uid}"
+                val headers = mapOf(
+                    "Cookie" to "stuid=${session.uid}; stoken=${session.stoken}; mid=${session.mid}; " +
+                        "ltoken=${session.ltoken}; ltuid=${session.uid}; cookie_token=${session.cookieToken}",
+                    "DS" to dsCn(q),
+                    "x-rpc-client_type" to "5",
+                    "x-rpc-app_version" to "2.116.0",
+                    "x-rpc-sys_version" to "17",
+                    "x-rpc-page" to "v4.6.0_#",
+                    "x-rpc-platform" to "5",
+                    "x-rpc-tool_verison" to "v4.6.0",
+                    "x-rpc-device_id" to UUID.randomUUID().toString().uppercase(),
+                    "x-rpc-device_name" to "${android.os.Build.MANUFACTURER}%20${android.os.Build.MODEL}",
+                    "x-rpc-device_fp" to deviceFp,
+                    "User-Agent" to "Mozilla/5.0 (Linux; Android ${android.os.Build.VERSION.RELEASE}; " +
+                        "${android.os.Build.MODEL} Build/CP2A.260605.016; wv) AppleWebKit/537.36 " +
+                        "(KHTML, like Gecko) Version/4.0 Chrome/153.0.0.0 Mobile Safari/537.36",
+                    "Origin" to "https://webstatic.mihoyo.com",
+                    "Referer" to "https://webstatic.mihoyo.com/",
+                    "X-Requested-With" to "com.mihoyo.hyperion",
+                    "Accept" to "application/json, text/plain, */*",
+                )
+                val resp = get(
+                    "https://api-takumi-record.mihoyo.com/game_record/app/card/wapi/getGameRecordCard?$q",
+                    headers,
+                )
+                val o = JSONObject(resp)
+                if (o.optInt("retcode") != 0) return@withContext emptyList()
+                val arr = o.optJSONObject("data")?.optJSONArray("list") ?: return@withContext emptyList()
+                (0 until arr.length()).mapNotNull { i ->
+                    val it = arr.optJSONObject(i) ?: return@mapNotNull null
+                    if (!it.optBoolean("has_role")) return@mapNotNull null
+                    val sub = listOf(it.optString("region_name"), it.optString("nickname"))
+                        .filter(String::isNotBlank).joinToString(" · ")
+                    GameRoleRow(
+                        gameName = it.optString("game_name"),
+                        levelText = "Lv.${it.optInt("level")}",
+                        subText = sub,
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+    /**
+     * 森空岛角色卡：cred → refresh 取 token → 签名请求 user/center。
+     * 注意：user/center 请求头必须去掉 is_new_tiger（实测携带会被网关 405 拦截）。
+     */
+    suspend fun fetchSklandRoles(session: AuthSession): List<GameRoleRow> =
+        withContext(Dispatchers.IO) {
+            try {
+                if (session.cred.isBlank()) return@withContext emptyList()
+                val refreshHeaders = sklandBaseHeaders() + mapOf(
+                    "timestamp" to seconds(),
+                    "cred" to session.cred,
+                )
+                val refreshResp = get("https://zonai.skland.com/api/v1/auth/refresh", refreshHeaders)
+                val token = JSONObject(refreshResp).optJSONObject("data")?.optString("token").orEmpty()
+                if (token.isBlank()) return@withContext emptyList()
+
+                val path = "/api/v1/user/center"
+                val ts = seconds()
+                val ca = JSONObject()
+                    .put("platform", "1")
+                    .put("timestamp", ts)
+                    .put("dId", sklandDid)
+                    .put("vName", "2.0.0")
+                    .toString()
+                val sign = md5(hmacSha256Hex(token, "$path$ts$ca"))
+                val headers = (sklandBaseHeaders() - "is_new_tiger") + mapOf(
+                    "timestamp" to ts,
+                    "cred" to session.cred,
+                    "sign" to sign,
+                )
+                val resp = get("https://zonai.skland.com$path", headers)
+                val o = JSONObject(resp)
+                if (o.optInt("code") != 0) return@withContext emptyList()
+                val cards = o.optJSONObject("data")?.optJSONArray("gameCardList")
+                    ?: return@withContext emptyList()
+                (0 until cards.length()).mapNotNull { i ->
+                    val card = cards.optJSONObject(i) ?: return@mapNotNull null
+                    var level = -1
+                    var charName = ""
+                    var server = ""
+                    val keys = card.keys()
+                    while (keys.hasNext()) {
+                        val v = card.opt(keys.next())
+                        if (v is JSONObject && v.has("level")) {
+                            level = v.optInt("level")
+                            charName = v.optString("name")
+                            server = v.optString("serverName")
+                            break
+                        }
+                    }
+                    if (level < 0 && charName.isBlank()) return@mapNotNull null
+                    val sub = listOf(charName, server).filter(String::isNotBlank).joinToString(" · ")
+                    GameRoleRow(
+                        gameName = card.optString("name"),
+                        levelText = if (level >= 0) "Lv.$level" else "",
+                        subText = sub,
+                    )
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
 }

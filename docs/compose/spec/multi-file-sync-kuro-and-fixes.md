@@ -122,6 +122,14 @@ commits:
   - `items` key 改为 `"$platform:$uid"`（防同平台多账号键冲突）。
 - 后续 T15：用户提供森空岛/米游社（及库街区）角色列表接口 HAR → `UniAccount.roles` 模型 + 拉取缓存 + 角色行真实渲染（游戏名+等级）。
 
+### D12 角色数据接入（森空岛 + 米游社）
+- 报文依据：用户 2026-10-07 HAR + 公开签名实现交叉验证；两链路均本机实测 retcode=0。
+- 米游社：GET game_record/app/card/wapi/getGameRecordCard?uid=stuid；Cookie=stuid/stoken/mid/ltoken/ltuid/cookie_token（AuthSession 全有）；DS= salt xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs + t,r(100001..200000) + md5(salt&t&r&b=&q=uid=..)；client_type=5 WebView 头组（样本形态，设备头用 Build 真实值）。解析 data.list[]：game_name/level/region_name/nickname。
+- 森空岛：① GET /api/v1/auth/refresh（cred+基础头，无 sign，保留 is_new_tiger）→ data.token；② GET /api/v1/user/center（cred+新鲜 timestamp+sign=md5(HMAC-SHA256(token, path+ts+compactJson))，compactJson={platform,timestamp,dId,vName} 紧凑序固定；**请求头必须去掉 is_new_tiger**（实测带=网关 405），xsm/wtoken 不发（实测可省）。解析 data.gameCardList[]：外卡 name=游戏名，内嵌含 level 的对象取 level 与 name（游戏昵称）。
+- 脱敏：did/rid/x-rpc-device_id 运行时随机，device_fp 用进程随机值，型号头用 Build 真实值，UA 设备段用 Build——不落 HAR 中的作者设备标识。
+- 展示（账号卡展开区）：行1=游戏名 + Lv.xx（两列各占半，level 起点≈内容区中点，贴用户设计图）；行2=区服 · 游戏昵称（11sp 灰）。加载态「正在获取角色数据…」；空/失败「暂无角色数据」；kuro 按用户决策不接入。
+- 拉取时机：账号库进入时对 skland/mihoyo 账号后台拉取（内存态，失败静默空态）。
+
 ## [S3] Out of Scope
 - 消息的删除/编辑入口（同步机制支持删除传播，但本版无消息删除 UI；账号退出即账号记录删除）。
 - 云端旧单文件 `miunion-sync-v1` 数据迁移（彻底替换，旧文件忽略）。
@@ -144,4 +152,4 @@ commits:
 - [x] T12: GitHub 开源上传（脱敏 + git init + 公开仓库推送） — acceptance: 全仓库无作者设备标识/凭据残留；https://github.com/Yvhany/miunion 公开可访问 (covers: D9)
 - [x] T13: 设置「关于」二级页 — acceptance: 设置→关于进入二级页，图标居中靠上、显示 yvhan、v1.1.0；GitHub 行点击打开仓库页 (covers: D10; depends: T12)
 - [x] T14: 账号卡改版 UI（默认收起 + 旋转箭头角色区） — acceptance: 头部原样式保留；默认收起箭头▷、展开旋转90°变∨且角色区空态出现；卡片无操作按钮；折叠/展开流畅（像素级验证） (covers: D11)
-- [ ] T15: 角色数据接口接入 — acceptance: 森空岛/米游社角色列表报文入库，角色行显示真实游戏名+等级 (covers: D11; depends: T14, 用户提供抓包 HAR)
+- [ ] T15: 角色数据接口接入 — acceptance: 森空岛/米游社角色列表实测入库，账号卡展开显示真实游戏名+等级+区服昵称 (covers: D12; depends: T14, 用户 HAR)

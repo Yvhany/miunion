@@ -785,6 +785,7 @@ private fun MainScreen(
                         when (page) {
                             0 -> AccountsPage(
                                 accounts = accounts,
+                                sessions = sessions,
                                 onAdd = onAddAccount,
                                 nestedScroll = scrollBehavior.nestedScrollConnection,
                             )
@@ -938,9 +939,31 @@ private fun MainBottomBar(
 @Composable
 private fun AccountsPage(
     accounts: List<UniAccount>,
+    sessions: List<AuthSession>,
     onAdd: () -> Unit,
     nestedScroll: NestedScrollConnection,
 ) {
+    var rolesMap by remember { mutableStateOf(mapOf<String, List<GameRoleRow>>()) }
+    var rolesLoading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(accounts.map { "${it.platform}:${it.uid}" }) {
+        rolesLoading = true
+        val result = mutableMapOf<String, List<GameRoleRow>>()
+        for (account in accounts) {
+            val key = "${account.platform}:${account.uid}"
+            val session = sessions.find { it.platform == account.platform && it.uid == account.uid }
+                ?: sessions.find { it.platform == account.platform }
+            result[key] = when {
+                session == null -> emptyList()
+                account.platform == "skland" -> AuthApi.fetchSklandRoles(session)
+                account.platform == "mihoyo" -> AuthApi.fetchMihoyoGameRecord(session)
+                else -> emptyList()
+            }
+        }
+        rolesMap = result
+        rolesLoading = false
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -963,7 +986,12 @@ private fun AccountsPage(
             }
         } else {
             items(accounts, key = { "${it.platform}:${it.uid}" }) { account ->
-                AccountCard(account)
+                val key = "${account.platform}:${account.uid}"
+                AccountCard(
+                    account = account,
+                    roles = rolesMap[key],
+                    rolesLoading = rolesLoading,
+                )
             }
         }
         item {
@@ -980,6 +1008,8 @@ private fun AccountsPage(
 @Composable
 private fun AccountCard(
     account: UniAccount,
+    roles: List<GameRoleRow>?,
+    rolesLoading: Boolean,
 ) {
     // 默认收起；箭头朝右（▷），展开时顺时针旋转 90° 朝下（∨）
     var expanded by remember(account.platform, account.uid) { mutableStateOf(false) }
@@ -1033,14 +1063,44 @@ private fun AccountCard(
             )
         }
 
-        // 展开区：角色行（缩进与昵称对齐），无接口时空态占位
+        // 展开区：角色行（缩进与昵称对齐），区分加载/空态/数据
         AnimatedVisibility(visible = expanded) {
             Column(modifier = Modifier.padding(start = 58.dp, top = 14.dp)) {
-                Text(
-                    text = "暂无角色数据 · 待接口接入",
-                    fontSize = 12.sp,
-                    color = MiuixTheme.colorScheme.onBackgroundVariant,
-                )
+                when {
+                    roles == null && rolesLoading -> Text(
+                        text = "正在获取角色数据…",
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    )
+                    roles.isNullOrEmpty() -> Text(
+                        text = "暂无角色数据",
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onBackgroundVariant,
+                    )
+                    else -> roles.forEachIndexed { index, row ->
+                        if (index > 0) Spacer(Modifier.height(10.dp))
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = row.gameName,
+                                fontSize = 13.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text = row.levelText,
+                                fontSize = 13.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        if (row.subText.isNotBlank()) {
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text = row.subText,
+                                fontSize = 11.sp,
+                                color = MiuixTheme.colorScheme.onBackgroundVariant,
+                            )
+                        }
+                    }
+                }
             }
         }
     }
